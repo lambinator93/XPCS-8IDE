@@ -1,0 +1,27 @@
+{
+ "Beamline" : "8IDE_2025_3",
+ "Geometry" : "Vertical",
+ "Compound" : "IPA_NBH_1",
+ "Particle" : "A4",
+ "Base"     : "/Volumes/Eriks_4TB/shpyrko202510/analysis/Twotime_PostExpt_01/",
+ "Processed": "processed/",
+    
+ "1":   "A001_IPA_NBH_1_att0100_080K_001_results.hdf",
+ "10":  "A010_IPA_NBH_1_att0100_080K_001_results.hdf",
+ "17":  "A017_IPA_NBH_1_att0100_100K_001_results.hdf",
+ "23":  "A023_IPA_NBH_1_att0100_119K_001_results.hdf",
+ "29":  "A029_IPA_NBH_1_att0100_140K_001_results.hdf",
+ "36":  "A036_IPA_NBH_1_att0100_159K_001_results.hdf",
+ "42":  "A042_IPA_NBH_1_att0100_179K_001_results.hdf",
+ "48":  "A048_IPA_NBH_1_att0100_200K_001_results.hdf",
+ "53":  "A053_IPA_NBH_1_att0100_220K_001_results.hdf",
+ "63":  "A063_IPA_NBH_1_att0100_239K_001_results.hdf",
+ "73":  "A073_IPA_NBH_1_att0100_260K_001_results.hdf",
+ "78":  "A078_IPA_NBH_1_att0100_280K_001_results.hdf",
+ "83":  "A083_IPA_NBH_1_att0100_300K_001_results.hdf",
+ "88":  "A088_IPA_NBH_1_att0100_320K_001_results.hdf",
+ "93":  "A093_IPA_NBH_1_att0100_340K_001_results.hdf",
+ "98":  "A098_IPA_NBH_1_att0100_360K_001_results.hdf",
+ "101": "A101_IPA_NBH_1_att0100_380K_001_results.hdf",
+ "104": "A104_IPA_NBH_1_att0100_399K_001_results.hdf"
+}
