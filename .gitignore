@@ -8,3 +8,4 @@
 /dataSources.local.xml
 # Emilio's python environment
 .python-version
+.idea/
