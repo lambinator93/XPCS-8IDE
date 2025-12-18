@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import os
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 import argparse
 from matplotlib.cm import get_cmap
 from matplotlib.colors import ListedColormap

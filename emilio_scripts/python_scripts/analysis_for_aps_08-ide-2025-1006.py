@@ -111,7 +111,7 @@ def static_vs_dynamic_bins(filename):
 
     for i in range(300):
         individual_mask = dynamic_roi_map.copy()
-        individual_mask[individual_mask != i] = 0
+        individual_mask[individual_mask != i+1] = 0
         individual_mask[individual_mask != 0] = 1
         scattering_2d_masked = scattering_2d_reshape * individual_mask
         individual_mask_intensity.append(np.sum(scattering_2d_masked))
@@ -126,7 +126,7 @@ def static_vs_dynamic_bins(filename):
 
     plt.figure()
     # plt.plot(individual_mask_intensity)
-    plt.semilogy(individual_mask_intensity)
+    plt.semilogy(np.arange(1, 301, 1), individual_mask_intensity)
     plt.xlabel('mask number')
     plt.ylabel('integrated intensity')
 
@@ -154,7 +154,7 @@ def combined_plot(filename):
         q = f["xpcs/qmap/dynamic_v_list_dim0"][...]
         phi = f["xpcs/qmap/dynamic_v_list_dim1"][...]
 
-    run_name = os.path.basename(A013).split("_")[0]
+    run_name = os.path.basename(h5_file).split("_")[0]
 
 
     scattering_2d_reshape = scattering_2d[0, :, :]
@@ -184,7 +184,9 @@ def combined_plot(filename):
     i = np.argmax(individual_mask_intensity)
     # idxs = [0, 1, -1, -31, -30, -29, 29, 30, 31] + i
     idxs = [-29, 1, 31, -30, 0, 30, -31, -1, 29] + i
-    print(idxs)
+
+    masks = dynamic_roi_map.copy()
+    combined_mask = np.isin(masks, idxs).astype(int)
 
     im = dynamic_roi_map.copy()
     im[~np.isin(im, idxs)] = 0
@@ -192,17 +194,11 @@ def combined_plot(filename):
     plt.figure()
     plt.imshow(im)
 
-    q_mask = q[int(9 - (i // 30))]
-    phi_mask  = phi[int(i % 30)]
-
-
-    a = q_mask / phi_mask
-
     plt.figure()
     x = np.arange(len(g2[:, 100]))
     # plt.errorbar(delay[0, :], G2_result, yerr=G2_error, fmt='none', ecolor='b', capsize=2)
     for i in idxs:
-        plt.semilogx(x, g2[:, i], label='M' + str(i) + ', q='+f"{q[int((i // 30))]:.3f}"
+        plt.semilogx(x, g2[:, i-1], label='M' + str(i) + ', q='+f"{q[int((i // 30))]:.3f}"
                                         + ',  phi='+f"{phi[int(i % 30)]:.3f}")
     plt.title('g2 autocorrelation for experiment ' + run_name)
     plt.ylabel('g2(q,tau)')
@@ -219,9 +215,9 @@ def combined_plot(filename):
         # renomalize C
         # C = C - np.min(C)
         # C = C / np.max(C)
-        lo, hi = np.percentile(C, [0.1, 99.9])
-        C_clip = np.clip(C, lo, hi)
-        C = (C_clip - lo) / (hi - lo) + 1
+        lo, hi = np.percentile(C, [0, 99.9])
+        C = np.clip(C, lo, hi)
+        # C = (C_clip - lo) / (hi - lo)
         # ax.set_title(f"M{idxs[i]}")
         ax.axis("off")
         # ax.set_ylabel('Frame number')
@@ -249,13 +245,46 @@ def combined_plot(filename):
 
     plt.tight_layout()
 
+    plt.figure()
+
+    I = scattering_2d_reshape.astype(float)
+    I[combined_mask == 1] *= 10
+
+    cmap = plt.cm.plasma.copy()
+    cmap.set_under("black")  # or "navy", etc.
+    cmap.set_bad("black")  # for NaN/inf
+
+    ys, xs = np.where(combined_mask == 1)
+    cy = int(np.round(ys.mean()))
+    cx = int(np.round(xs.mean()))
+    half = 200
+    ymin = max(cy - half, 0)
+    ymax = min(cy + half, I.shape[0])
+    xmin = max(cx - half, 0)
+    xmax = min(cx + half, I.shape[1])
+    img_crop = I[ymin:ymax, xmin:xmax]
+    mask_crop = combined_mask[ymin:ymax, xmin:xmax]
+
+    plt.imshow(img_crop, origin="lower", cmap=cmap, norm=LogNorm(vmin=0.1, vmax=I.max()))
+    plt.colorbar()
+
+    # plt.figure()
+    # plt.imshow(combined_mask)
+
+    print(run_name)
+    print(filename)
+
     plt.show()
 
 
+file_ID = 'A089'
 
-A013 = (r'/Users/emilioescauriza/Desktop/A013_IPA_NBH_1_att0100_079K_001_results.hdf')
-A018 = (r'/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/A018_IPA_NBH_1_att0100_100K_001_results.hdf')
-h5_file = A013
+if file_ID == 'A013':
+    filename = (r'/Users/emilioescauriza/Desktop/A013_IPA_NBH_1_att0100_079K_001_results.hdf')
+else:
+    base = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006")
+    filename = next(base.glob(f"{file_ID}_*_results.hdf"))
+h5_file = filename
 
 
 if __name__ == "__main__":
