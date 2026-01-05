@@ -385,7 +385,6 @@ def figure_upload():
     ax.plot([0, 1, 2], [1, 4, 2])
     image_upload(fig, target_cell="AF142", upload_name="run123_overview.png")
     plt.close(fig)
-    # a = 1
 
 
 
