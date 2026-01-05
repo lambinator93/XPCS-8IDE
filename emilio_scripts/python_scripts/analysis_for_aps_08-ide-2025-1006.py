@@ -277,7 +277,119 @@ def combined_plot(filename):
     plt.show()
 
 
-file_ID = 'A089'
+def oauth_test():
+    SCOPES = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = ('/Users/emilioescauriza/Documents/repos/006_APS_8IDE/emilio_scripts/python_scripts/client_secret_'
+                  '180145739842-0ug37lsh4qltki62e8te8bqkde9u25jb.apps.googleusercontent.com.json')
+
+    def get_creds():
+        creds = None
+        if Path("token.json").exists():
+            creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    credentials, SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+            Path("token.json").write_text(creds.to_json())
+
+        return creds
+
+    creds = get_creds()
+    gc = gspread.authorize(creds)
+
+    # Paste your spreadsheet ID here
+    sh = gc.open_by_key("1OAA7H4I3cgas32aSZkrLB8TOKHymMAv2uk_0eTywWcQ")
+    print("Opened spreadsheet:", sh.title)
+
+
+def image_upload(fig, target_cell="AF142", upload_name="matplotlib_output.png",
+                 tab_name="IPA NBH",
+                 spreadsheet_id="1OAA7H4I3cgas32aSZkrLB8TOKHymMAv2uk_0eTywWcQ",
+                 token_path="token.json",
+                 creds_path="client_secret_180145739842-0ug37lsh4qltki62e8te8bqkde9u25jb.apps.googleusercontent.com.json"):
+
+    SCOPES = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    def get_creds():
+        creds = None
+        if Path(token_path).exists():
+            creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
+                creds = flow.run_local_server(port=0)
+            Path(token_path).write_text(creds.to_json())
+        return creds
+
+    creds = get_creds()
+
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(tab_name)
+
+    cols, rows = find_rows_with_position(ws, "A5")
+
+    print(cols)
+
+    for cell in rows_to_cells(rows, "AF"):
+        print(cell)
+        # image_upload(fig, target_cell=cell, upload_name=f"A5_{cell}.png")
+
+
+    # drive = build("drive", "v3", credentials=creds)
+    #
+    # buf = BytesIO()
+    # try:
+    #     fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    #     buf.seek(0)
+    #
+    #     media = MediaIoBaseUpload(buf, mimetype="image/png", resumable=False)
+    #     created = drive.files().create(
+    #         body={"name": upload_name},
+    #         media_body=media,
+    #         fields="id"
+    #     ).execute()
+    #
+    #     file_id = created["id"]
+    #
+    #     drive.permissions().create(
+    #         fileId=file_id,
+    #         body={"type": "anyone", "role": "reader"},
+    #     ).execute()
+    #
+    #     image_url = f"https://drive.google.com/uc?export=view&id={file_id}"
+    #     formula = f'=IMAGE("{image_url}", 4, 180, 320)'
+    #
+    #     ws.update(target_cell, [[formula]], value_input_option="USER_ENTERED")
+    #     print(f"Inserted image into {ws.title} cell {target_cell}")
+    #
+    # finally:
+    #     buf.close()
+
+def figure_upload():
+
+    fig, ax = plt.subplots()
+    ax.plot([0, 1, 2], [1, 4, 2])
+    image_upload(fig, target_cell="AF142", upload_name="run123_overview.png")
+    plt.close(fig)
+    # a = 1
+
+
+
+file_ID = 'A013'
 
 if file_ID == 'A013':
     filename = (r'/Users/emilioescauriza/Desktop/A013_IPA_NBH_1_att0100_079K_001_results.hdf')
@@ -295,5 +407,8 @@ if __name__ == "__main__":
     # intensity_vs_time(h5_file)
     # static_vs_dynamic_bins(h5_file)
     combined_plot(h5_file)
+    # oauth_test()
+    # image_upload()
+    # figure_upload()
 
     pass

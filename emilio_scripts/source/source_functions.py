@@ -14,7 +14,6 @@ import h5py
 import hdf5plugin
 import sys
 import matplotlib.pyplot as plt
-from source_functions import *
 from xpcs import *
 from sims import *
 # from autocorrelations import *
@@ -24,6 +23,99 @@ import pyopencl as cl
 from pathlib import Path
 import json
 from scipy.fft import fft, ifft, fftfreq
+import gspread
+from io import BytesIO
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+
+
+
+
+def find_results_hdf(base_dir: Path, sample_id: str) -> Path | None:
+    pattern = f"{sample_id}_*_results.hdf"
+    matches = sorted(base_dir.glob(pattern))
+    return matches[0] if matches else None
+
+def get_ids_for_position(ws, position_name, id_col=1, position_col=3, header_rows=1):
+    """
+    Return a list of (row_number, sample_id) for rows where column C == position_name.
+
+    Parameters
+    ----------
+    ws : gspread.Worksheet
+    position_name : str
+        e.g. "A5"
+    id_col : int
+        Column index for sample ID (A = 1)
+    position_col : int
+        Column index for position name (C = 3)
+    header_rows : int
+        Number of header rows to skip (usually 1)
+
+    Returns
+    -------
+    list of (int, str)
+        [(row_number, sample_id), ...]
+    """
+    col_ids = ws.col_values(id_col)
+    col_pos = ws.col_values(position_col)
+
+    n = min(len(col_ids), len(col_pos))
+    results = []
+
+    for i in range(header_rows, n):
+        if col_pos[i].strip() == position_name:
+            results.append((i + 1, col_ids[i].strip()))
+
+    return results
+
+def find_rows_with_position(ws, position_name="A5"):
+    """
+    Returns a list of row numbers where column C equals position_name.
+    Assumes row 1 is header.
+    """
+    col_a = ws.col_values(1)  # Column A = index 1
+    col_c = ws.col_values(3)  # Column C = index 3
+
+    matching_rows = [
+        i + 1                      # convert 0-based index → 1-based row
+        for i, val in enumerate(col_c)
+        if val == position_name
+    ]
+
+    ids = [
+        col_a[i]
+        for i in range(1, min(len(col_a), len(col_c)))
+        if col_c[i] == position_name
+    ]
+
+    return ids, matching_rows
+
+def get_rows_and_ids_for_position(ws, position_name="A5", id_col=1, position_col=3, header_rows=1):
+    col_a = ws.col_values(id_col)
+    col_c = ws.col_values(position_col)
+
+    start = header_rows  # 0-based index into lists
+    n = min(len(col_a), len(col_c))
+
+    out = []
+    for i in range(start, n):
+        if col_c[i].strip() == position_name:
+            out.append((i + 1, col_a[i].strip()))  # (sheet_row_number, ID)
+    return out
+
+
+def find_results_hdf(base_dir: Path, sample_id: str) -> Path | None:
+    pattern = f"{sample_id}_*_results.hdf"
+    matches = sorted(base_dir.glob(pattern))
+    return matches[0] if matches else None
+
+def rows_to_cells(rows, column_letter="AF"):
+    return [f"{column_letter}{r}" for r in rows]
+
 
 def display_images(image_array, coords):
     fig, ax = plt.subplots()
