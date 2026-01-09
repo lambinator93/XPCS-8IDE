@@ -204,12 +204,26 @@ def load_common_arrays(hdf_path: Path):
 def neighborhood_offsets(n: int, stride: int = 30) -> list[int]:
     """
     Offsets for an n×n neighborhood around a center index in a flattened (q,phi) grid.
-    stride is the number of phi bins (30 in your data).
+
+    This ordering matches your original 3×3 layout:
+        [-29,   1,  31,
+         -30,   0,  30,
+         -31,  -1,  29]
+    i.e. rows step in phi (dx), columns step in q (dy*stride).
     """
     if n % 2 == 0:
         raise ValueError("n must be odd (e.g., 3, 5).")
+
     r = n // 2
-    return [dy * stride + dx for dy in range(-r, r + 1) for dx in range(-r, r + 1)]
+    offsets = []
+
+    # rows: dx = +r ... -r (top to bottom)
+    # cols: dy = -r ... +r (left to right)
+    for dx in range(r, -r - 1, -1):
+        for dy in range(-r, r + 1):
+            offsets.append(dy * stride + dx)
+
+    return offsets
 
 
 def compute_idxs(dynamic_roi_map, scattering_2d_reshape, n_masks=300, grid_n=3, stride=30):
@@ -312,6 +326,28 @@ def make_twotime_fig(sample_id, hdf_path, idxs, grid_n=3, figsize=(7, 7), title_
 
         ax.axis("off")
         ax.imshow(C, origin="lower", cmap="plasma")
+
+        label = (
+            f"M{mi}\n"
+            f"min {np.min(C):.2f}\n"
+            f"max {np.max(C):.2f}"
+        )
+
+        ax.text(
+            0.05, 0.95,
+            label,
+            transform=ax.transAxes,  # axes-relative coordinates
+            ha="left",
+            va="top",
+            fontsize=12,
+            color="white",
+            bbox=dict(
+                boxstyle="round,pad=0.25",
+                facecolor="black",
+                alpha=0.6,
+                edgecolor="none",
+            ),
+        )
 
     fig.suptitle(f"{sample_id} {title_suffix}", fontsize=24)
     fig.tight_layout()
@@ -443,6 +479,113 @@ def process_position(
         )
 
 
+def plot_single_mask_scan(
+    sample_id: str,
+    mask_n: int,
+    base_dir: Path,
+    out_dir: Path,
+    *,
+    dpi: int = 250,
+    figsize=(14, 5),
+):
+    """
+    Plot overview + g2 + TTC for ONE mask index from ONE scan,
+    and save locally as a single combined PNG.
+
+    Output:
+      out_dir/individual_scan_plots/<sample_id>/<sample_id>_mask_<mask_n>.png
+    """
+
+    # --------------------------------------------------
+    # Locate HDF
+    # --------------------------------------------------
+    hdf_path = find_results_hdf(base_dir, sample_id)
+    if hdf_path is None:
+        raise FileNotFoundError(f"No results HDF found for {sample_id}")
+
+    # --------------------------------------------------
+    # Load required data
+    # --------------------------------------------------
+    dynamic_roi_map, scattering_2d_reshape = load_common_arrays(hdf_path)
+    g2, q, phi = load_g2_q_phi(hdf_path)
+    C = load_c2_map(hdf_path, mask_n)
+
+    # --------------------------------------------------
+    # Build combined figure
+    # --------------------------------------------------
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.1, 1.2, 1.1])
+
+    # ---------- (1) Overview ----------
+    ax0 = fig.add_subplot(gs[0])
+    mask = (dynamic_roi_map == mask_n).astype(np.int8)
+
+    I = scattering_2d_reshape.astype(float, copy=False).copy()
+    I[mask == 1] *= 10
+
+    ys, xs = np.where(mask == 1)
+    cy, cx = int(ys.mean()), int(xs.mean())
+    half = 200
+    ymin, ymax = max(cy-half, 0), min(cy+half, I.shape[0])
+    xmin, xmax = max(cx-half, 0), min(cx+half, I.shape[1])
+
+    im0 = ax0.imshow(
+        I[ymin:ymax, xmin:xmax],
+        origin="lower",
+        cmap="plasma",
+        norm=LogNorm(vmin=0.1, vmax=np.nanmax(I)),
+    )
+    ax0.set_title(f"{sample_id} mask {mask_n}\noverview")
+    ax0.axis("off")
+    fig.colorbar(im0, ax=ax0, fraction=0.046)
+
+    # ---------- (2) g2 ----------
+    ax1 = fig.add_subplot(gs[1])
+    tau = np.arange(g2.shape[0])
+    j = mask_n - 1
+    if 0 <= j < g2.shape[1]:
+        ax1.semilogx(tau, g2[:, j], lw=2)
+        ax1.set_title(
+            f"g2\nq={q[int(mask_n//30)]:.3f}, φ={phi[int(mask_n%30)]:.3f}"
+        )
+    ax1.set_xlabel("Delay time τ")
+    ax1.set_ylabel("g2(τ)")
+    ax1.grid(True, alpha=0.3)
+
+    # ---------- (3) Two-time ----------
+    ax2 = fig.add_subplot(gs[2])
+    C = C + C.T - np.diag(np.diag(C))
+    lo, hi = np.percentile(C, [0, 99.9])
+    C = np.clip(C, lo, hi)
+
+    im2 = ax2.imshow(C, origin="lower", cmap="plasma")
+    ax2.set_title("Two-time correlation")
+    ax2.set_xlabel("t₁")
+    ax2.set_ylabel("t₂")
+    fig.colorbar(im2, ax=ax2, fraction=0.046)
+
+    fig.suptitle(f"{sample_id} – mask {mask_n}", fontsize=16)
+    fig.tight_layout()
+
+    # --------------------------------------------------
+    # Save locally
+    # --------------------------------------------------
+    out_path = (
+        out_dir
+        / "individual_scan_plots"
+        / sample_id
+    )
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    fname = out_path / f"{sample_id}_mask_{mask_n:03d}.png"
+    fig.savefig(fname, dpi=dpi, bbox_inches="tight")
+
+    plt.show()
+
+    plt.close(fig)
+
+    return fname
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -495,12 +638,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-BASE_DIR = Path("/Users/emilioescauriza/Desktop")
-# BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
+# BASE_DIR = Path("/Users/emilioescauriza/Desktop")
+BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
 # BASE_DIR = Path("/Volumes/Eriks_4TB/shpyrko202510/analysis/Twotime_PostExpt_01")
 POSITION_NAME = "A5"
 # Which plots to generate (None = generate all 6)
-GENERATE_KEYS = None  # None or for example: {"overview_25", "twotime_25"} to only generate these two
+GENERATE_KEYS = {"twotime_9", "twotime_25"}  # None or for example: {"overview_25", "twotime_25"} to only generate these two
 UPLOAD_TO_SHEETS = True  # True of False
 UPLOAD_KEYS = None  # or example: {"overview_25"} to upload only overview_25 only but still generate others
 
@@ -509,7 +652,14 @@ if __name__ == "__main__":
     creds = get_creds(TOKEN_PATH, CREDS_PATH)
     ws, drive = get_ws_and_drive(creds, SPREADSHEET_ID, TAB_NAME)
 
-    process_position(POSITION_NAME, BASE_DIR, ws, drive)  # run all the files for a position AXXXX
-    # process_position(POSITION_NAME, BASE_DIR, ws, drive, start_sample_id="A017")  # start from a position AXXXX
+    # process_position(POSITION_NAME, BASE_DIR, ws, drive)  # run all the files for a position AXXXX
+    process_position(POSITION_NAME, BASE_DIR, ws, drive, start_sample_id="A084")  # start from a position AXXXX
+
+    # plot_single_mask_scan(
+    #     sample_id="A073",
+    #     mask_n=116,
+    #     base_dir=BASE_DIR,
+    #     out_dir=OUT_DIR,
+    # )
 
     pass

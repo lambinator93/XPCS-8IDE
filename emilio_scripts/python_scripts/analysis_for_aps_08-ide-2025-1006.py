@@ -388,12 +388,12 @@ def figure_upload():
 
 
 
-file_ID = 'A013'
+file_ID = 'A073'
 
 if file_ID == 'A013':
     filename = (r'/Users/emilioescauriza/Desktop/A013_IPA_NBH_1_att0100_079K_001_results.hdf')
 else:
-    base = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006")
+    base = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
     filename = next(base.glob(f"{file_ID}_*_results.hdf"))
 h5_file = filename
 
@@ -404,8 +404,8 @@ if __name__ == "__main__":
     # g2_plotter(h5_file)
     # ttc_plotter(h5_file)
     # intensity_vs_time(h5_file)
-    # static_vs_dynamic_bins(h5_file)
-    combined_plot(h5_file)
+    static_vs_dynamic_bins(h5_file)
+    # combined_plot(h5_file)
     # oauth_test()
     # image_upload()
     # figure_upload()
