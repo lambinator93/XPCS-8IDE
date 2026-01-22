@@ -143,6 +143,10 @@ def static_vs_dynamic_bins(filename):
     plt.figure()
     plt.imshow(np.log(scattering_2d_reshape)+1e-5)
 
+    # np.savetxt('dynamic_roi_map.txt', dynamic_roi_map)
+    # print(np.shape(dynamic_roi_map))
+
+
     plt.show()
 
 def combined_plot(filename):
@@ -388,7 +392,7 @@ def figure_upload():
 
 
 
-file_ID = 'A073'
+file_ID = 'A013'
 
 if file_ID == 'A013':
     filename = (r'/Users/emilioescauriza/Desktop/A013_IPA_NBH_1_att0100_079K_001_results.hdf')

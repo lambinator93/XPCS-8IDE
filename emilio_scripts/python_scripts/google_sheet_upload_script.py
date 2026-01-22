@@ -852,18 +852,23 @@ if __name__ == "__main__":
     creds = get_creds(TOKEN_PATH, CREDS_PATH)
     ws, drive = get_ws_and_drive(creds, SPREADSHEET_ID, TAB_NAME)
 
-    # process_position(POSITION_NAME, BASE_DIR, ws, drive)  # run all the files for a position AXXXX
-    process_position(POSITION_NAME, BASE_DIR, ws, drive, start_sample_id="A031")  # start from a position AXXXX
+    # position_names = ['A6', 'A7', 'A8']
+    #
+    # for position_name in position_names:
+    #     process_position(position_name, BASE_DIR, ws, drive)  # run all the files for a position AXXXX
 
-    # plot_single_mask_scan(
-    #     sample_id="A073",
-    #     mask_n=204,
-    #     base_dir=BASE_DIR,
-    #     out_dir=OUT_DIR,
-    #     grid_n=5,
-    #     border_width=1,
-    #     dpi=250,
-    #     ws=ws
-    # )
+    # process_position(POSITION_NAME, BASE_DIR, ws, drive)  # run all the files for a position AXXXX
+    # process_position(POSITION_NAME, BASE_DIR, ws, drive, start_sample_id="A031")  # start from a position AXXXX
+
+    plot_single_mask_scan(
+        sample_id="A073",
+        mask_n=26,
+        base_dir=BASE_DIR,
+        out_dir=OUT_DIR,
+        grid_n=5,
+        border_width=1,
+        dpi=250,
+        ws=ws
+    )
 
     pass
