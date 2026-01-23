@@ -404,11 +404,11 @@ h5_file = filename
 
 if __name__ == "__main__":
 
-    # h5_file_inspector(h5_file)
+    h5_file_inspector(h5_file)
     # g2_plotter(h5_file)
     # ttc_plotter(h5_file)
     # intensity_vs_time(h5_file)
-    static_vs_dynamic_bins(h5_file)
+    # static_vs_dynamic_bins(h5_file)
     # combined_plot(h5_file)
     # oauth_test()
     # image_upload()

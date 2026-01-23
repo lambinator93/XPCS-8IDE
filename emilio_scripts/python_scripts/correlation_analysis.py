@@ -6,8 +6,8 @@ from typing import Optional, Tuple, Dict, Any
 
 import h5py
 import numpy as np
-from matplotlib.patches import FancyArrowPatch
 
+from matplotlib.patches import FancyArrowPatch
 import matplotlib as mpl
 mpl.use("macosx")  # must be set before importing pyplot
 import matplotlib.pyplot as plt
@@ -90,18 +90,6 @@ def save_xpcs_npz(out_path: Path, data: XPCSData) -> Path:
 # ============================================================
 # TTC preprocessing + utilities
 # ============================================================
-
-def symmetrize_ttc(ttc: np.ndarray) -> np.ndarray:
-    """Mirror TTC along x=y: C -> C + C.T - diag(diag(C))."""
-    C0 = np.asarray(ttc, dtype=np.float64)
-    return C0 + C0.T - np.diag(np.diag(C0))
-
-
-def clip_ttc(C: np.ndarray, p_hi: float = 99.9) -> np.ndarray:
-    """Clip extreme outliers so one pixel doesn't dominate plots/fits."""
-    lo, hi = np.percentile(C, [0.0, p_hi])
-    return np.clip(C, lo, hi)
-
 
 def despike_patch_with_local_median(C: np.ndarray, center: Tuple[int, int], halfwidth: int = 1) -> np.ndarray:
     """
@@ -400,7 +388,7 @@ def extract_fit_antidiagonal_with_ttc_plot(
     ks = np.arange(0, kmax + 1, dtype=int)
     t1 = i - ks
     t2 = i + ks
-    y = C[t1, t2]
+    y = C[t2, t1]
 
     tau_idx = 2 * ks
     t = tau_idx.astype(np.float64) * float(dt_s)
@@ -417,9 +405,10 @@ def extract_fit_antidiagonal_with_ttc_plot(
     # ----------------------------
     # FFT analysis (NEW – put it HERE)
     # ----------------------------
+    dt_fft = 2.0 * dt_s
     freqs, power, f_peak, period_s, p_peak = fft_peak_from_lineout(
         y,
-        dt_s,
+        dt_fft,
         detrend=True,
         window="hann",
         fmin=1 / 1000,  # periods ≤ 1000 s
@@ -457,8 +446,8 @@ def extract_fit_antidiagonal_with_ttc_plot(
     # Left: TTC + arrow
     im = ax0.imshow(C, origin="lower", cmap="plasma", interpolation="nearest")
     ax0.set_title(f"{sample_id}  M{mask_n}  TTC")
-    ax0.set_xlabel("t₂ index")
-    ax0.set_ylabel("t₁ index")
+    ax0.set_xlabel("t₁ index")
+    ax0.set_ylabel("t₂ index")
 
     end_t1 = i - kmax
     end_t2 = i + kmax
@@ -522,7 +511,7 @@ def extract_antidiagonal_lineout(
 
     t1 = i - ks
     t2 = i + ks
-    y = C[t1, t2]
+    y = C[t2, t1]
 
     tau_idx = 2 * ks
     t = tau_idx * dt_s
@@ -598,7 +587,7 @@ def plot_ttc_lineout_fft(
     Cplot = clip_ttc(C, p_hi=clip_hi_percentile)
 
     t, y = extract_antidiagonal_lineout(
-        C,
+        data.ttc,
         start_idx=start_idx,
         dt_s=dt_s,
         clip_percentile=clip_hi_percentile,
@@ -966,7 +955,7 @@ def extract_antidiagonal_lineout_y_only(Csym: np.ndarray, start_idx: int, *, dro
     ks = np.arange(0, kmax + 1, dtype=int)
     t1 = i - ks
     t2 = i + ks
-    y = Csym[t1, t2]
+    y = Csym[t2, t1]
 
     if drop_first > 0:
         y = y[drop_first:]
@@ -982,6 +971,7 @@ def plot_period_vs_diagonal_start(
     # preprocessing
     clip_hi_percentile: float = 99.9,
     drop_first_lineout: int = 0,
+    drop_first_horizontal: int = 0,  # keep this 0 for your use-case
     # smoothing
     half_window: int = 5,            # <-- NEW: n lineouts either side
     band_ci: float = 0.68,           # <-- NEW: central CI for shaded band (0.68 ~ 1σ)
@@ -1090,7 +1080,7 @@ def plot_period_vs_diagonal_start(
     # Left: TTC with start points
     ax0 = fig.add_subplot(gs[0])
     im = ax0.imshow(Cplot, origin="lower", cmap=cmap, interpolation="nearest")
-    ax0.set_title("TTC + diagonal start positions")
+    ax0.set_title(SAMPLE_ID + " mask " + str(MASK_N) + " TTC + diagonal start positions")
     ax0.set_xlabel("t₁ index")
     ax0.set_ylabel("t₂ index")
 
@@ -1112,7 +1102,7 @@ def plot_period_vs_diagonal_start(
         label=f"{int(band_ci*100)}% window band",
     )
 
-    ax1.set_title("Peak period vs diagonal start time")
+    ax1.set_title(SAMPLE_ID + " M" + str(MASK_N) + " peak period vs diagonal start time")
     ax1.set_xlabel("Diagonal start time  (t = start_idx · dt_s)  [s]")
     ax1.set_ylabel("Peak period  [s]")
     ax1.grid(True, alpha=0.3)
@@ -1133,22 +1123,14 @@ def plot_period_vs_diagonal_start(
         "band_ci": band_ci,
     }
 
-def peak_period_from_start_idx(
-    data,
-    start_idx,
-    dt_s,
-    *,
-    fmin,
-    fmax,
-):
-    C = symmetrize_ttc(data.ttc)
-    tau_idx, y, _ = extract_antidiagonal_lineout(C, start_idx)
+def peak_period_from_start_idx(data, start_idx, dt_s, *, fmin, fmax):
+    t, y = extract_antidiagonal_lineout(
+        data.ttc, start_idx=int(start_idx), dt_s=float(dt_s), clip_percentile=None
+    )
+    dt_fft = 2.0 * float(dt_s)  # anti-diagonal sampling
     _, _, f_peak, period_s, _ = fft_peak_from_lineout(
-        y, dt_s,
-        detrend=True,
-        window="hann",
-        fmin=fmin,
-        fmax=fmax,
+        y, dt_fft,
+        detrend=True, window="hann", fmin=fmin, fmax=fmax
     )
     return period_s
 
@@ -1229,18 +1211,394 @@ def smoothed_peak_period_vs_time(
 
     return period, period_lo, period_hi
 
+def extract_horizontal_lineout_y_only(
+    C: np.ndarray,
+    start_idx: int,
+    *,
+    drop_first: int = 0,
+) -> np.ndarray:
+    """
+    Horizontal lineout at fixed t2=i, from t1=0..i (ends at the diagonal).
+    C indexed as C[t2, t1].
+    """
+    C = np.asarray(C, dtype=np.float64)
+    n = C.shape[0]
+    i = int(start_idx)
 
+    if C.ndim != 2 or C.shape[0] != C.shape[1]:
+        raise ValueError(f"TTC must be square, got {C.shape}")
+    if not (0 <= i < n):
+        raise ValueError(f"start_idx must be in [0, {n-1}]")
+
+    y = C[i, 0:i + 1]  # row=t2=i, col=t1=0..i
+
+    if drop_first > 0:
+        y = y[int(drop_first):]
+
+    return y.astype(np.float64)
+
+
+def _extract_antidiagonal_y_only(
+    C: np.ndarray,
+    start_idx: int,
+    *,
+    drop_first: int = 0,
+) -> np.ndarray:
+    """
+    Anti-diagonal through (t1=i, t2=i): (t1=i-k, t2=i+k), k>=0.
+    IMPORTANT: C is indexed as C[t2, t1] (row=t2, col=t1).
+    """
+    C = np.asarray(C, dtype=np.float64)
+    n = C.shape[0]
+    i = int(start_idx)
+
+    if C.ndim != 2 or C.shape[0] != C.shape[1]:
+        raise ValueError(f"TTC must be square, got {C.shape}")
+    if not (0 <= i < n):
+        raise ValueError(f"start_idx must be in [0, {n-1}]")
+
+    kmax = min(i, n - 1 - i)
+    ks = np.arange(0, kmax + 1, dtype=int)
+
+    t1 = i - ks
+    t2 = i + ks
+
+    y = C[t2, t1]  # <-- FIXED (row=t2, col=t1)
+
+    if drop_first > 0:
+        y = y[int(drop_first):]
+
+    return y.astype(np.float64)
+
+
+def _rolling_smooth_with_band(
+    y: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    *,
+    half_window: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Simple local smoothing across start index:
+      - y_smooth: rolling mean of y
+      - lo_smooth: rolling min of lo
+      - hi_smooth: rolling max of hi
+    (keeps a conservative uncertainty band)
+    """
+    y = np.asarray(y, float)
+    lo = np.asarray(lo, float)
+    hi = np.asarray(hi, float)
+
+    n = len(y)
+    ys = np.full(n, np.nan, float)
+    los = np.full(n, np.nan, float)
+    his = np.full(n, np.nan, float)
+
+    for i in range(n):
+        a = max(0, i - int(half_window))
+        b = min(n, i + int(half_window) + 1)
+        m = np.isfinite(y[a:b]) & np.isfinite(lo[a:b]) & np.isfinite(hi[a:b])
+        if not np.any(m):
+            continue
+        ys[i] = float(np.mean(y[a:b][m]))
+        los[i] = float(np.min(lo[a:b][m]))
+        his[i] = float(np.max(hi[a:b][m]))
+    return ys, los, his
+
+def bootstrap_peak_frequency_fixedbin(
+    y: np.ndarray,
+    dt: float,
+    *,
+    fmin: float,
+    fmax: float,
+    peak_halfwidth_bins: int = 2,   # search only near the global peak
+    seg_len: int | None = None,
+    overlap: float = 0.5,
+    window: str = "hann",
+    detrend: bool = True,
+    n_boot: int = 2000,
+    ci: float = 0.68,
+    rng_seed: int = 0,
+):
+    """
+    Bootstrap CI for peak frequency, but prevents peak-hopping by
+    restricting the peak search to a small neighborhood around the
+    full-record peak.
+
+    Returns: f_hat, f_lo, f_hi, f_samples
+    """
+    y = np.asarray(y, float)
+    if detrend:
+        y = detrend_linear(y)
+
+    n = len(y)
+    if seg_len is None:
+        seg_len = max(64, n // 4)
+    seg_len = min(seg_len, n)
+
+    idx = segment_indices(n, seg_len, overlap)
+    if len(idx) < 3:
+        # fallback: use whole record
+        f, P = periodogram(y, dt, window=window)
+        m = (f >= fmin) & (f <= fmax)
+        if not np.any(m):
+            raise ValueError("No frequencies in band")
+        k0 = np.argmax(P[m])
+        f0 = float(f[m][k0])
+        return f0, f0, f0, np.array([f0])
+
+    # --- full-record PSD to define the reference peak bin ---
+    f_full, P_full = periodogram(y, dt, window=window)
+    band = (f_full >= fmin) & (f_full <= fmax)
+    if not np.any(band):
+        raise ValueError("No frequencies in band")
+    band_idxs = np.flatnonzero(band)
+    k_band_peak = band_idxs[np.argmax(P_full[band])]
+    k0 = int(k_band_peak)
+
+    # neighborhood search bins
+    k_lo = max(1, k0 - int(peak_halfwidth_bins))
+    k_hi = min(len(f_full) - 1, k0 + int(peak_halfwidth_bins))
+    neigh = np.arange(k_lo, k_hi + 1)
+
+    # --- PSD per segment on the same frequency grid ---
+    Ps = []
+    for (a, b) in idx:
+        f_seg, P_seg = periodogram(y[a:b], dt, window=window)
+        Ps.append(P_seg)
+    Ps = np.stack(Ps, axis=0)  # (K, nf)
+
+    rng = np.random.default_rng(rng_seed)
+    K = Ps.shape[0]
+    f_samp = np.empty(n_boot, float)
+
+    for i in range(n_boot):
+        picks = rng.integers(0, K, size=K)
+        Pmean = Ps[picks].mean(axis=0)
+
+        # pick peak ONLY within neighborhood
+        kk = neigh[np.argmax(Pmean[neigh])]
+        f_samp[i] = float(f_full[kk])
+
+    f_hat = float(np.median(f_samp))
+    alpha = (1.0 - float(ci)) / 2.0
+    f_lo = float(np.quantile(f_samp, alpha))
+    f_hi = float(np.quantile(f_samp, 1.0 - alpha))
+    return f_hat, f_lo, f_hi, f_samp
+
+
+def plot_period_vs_diagonal_start_both_lineouts(
+    data,
+    *,
+    dt_s: float,
+    start_idxs: np.ndarray | None = None,
+    # preprocessing / extraction
+    clip_hi_percentile: float = 99.9,
+    drop_first_antidiag: int = 0,
+    drop_first_horizontal: int = 0,
+    # smoothing / band (SAME methodology as plot_period_vs_diagonal_start)
+    half_window: int = 5,
+    band_ci: float = 0.68,
+    # FFT options
+    fmin: float | None = 1 / 1000,
+    fmax: float | None = 1 / 10,
+    detrend: bool = True,
+    window: str = "hann",
+    # plotting
+    cmap: str = "plasma",
+    figsize=(13.5, 6.0),
+):
+    """
+    Same methodology as plot_period_vs_diagonal_start(), but computes periods for BOTH:
+      1) anti-diagonal lineout through (i,i): (t1=i-k, t2=i+k)  -> dt_fft = 2*dt_s
+      2) horizontal lineout at t2=i: (t1=0..i)                 -> dt_fft = 1*dt_s
+
+    For each start index:
+      - compute RAW period estimate by FFT peak (no bootstrap)
+    Then:
+      - smooth by pooling ±half_window in *index space*
+      - compute robust band via quantiles (central CI = band_ci)
+    """
+    # --- TTC prep ---
+    C = symmetrize_ttc(data.ttc)
+    Cplot = clip_ttc(C, p_hi=float(clip_hi_percentile))
+
+    n = C.shape[0]
+    if start_idxs is None:
+        lo = int(0.05 * (n - 1))
+        hi = int(0.95 * (n - 1))
+        start_idxs = np.linspace(lo, hi, 90).astype(int)
+        start_idxs = np.unique(start_idxs)
+    else:
+        start_idxs = np.unique(np.asarray(start_idxs, dtype=int))
+
+    # FFT sampling intervals
+    dt_fft_anti = 2.0 * float(dt_s)
+    dt_fft_horz = 1.0 * float(dt_s)
+
+    # ------------------------------------------------------------
+    # Step 1: RAW period at each start index (anti + horizontal)
+    # ------------------------------------------------------------
+    raw_period_anti = np.full(start_idxs.shape, np.nan, dtype=float)
+    raw_period_horz = np.full(start_idxs.shape, np.nan, dtype=float)
+
+    for k, i in enumerate(start_idxs):
+        # --- anti-diagonal y ---
+        try:
+            y_a = extract_antidiagonal_lineout_y_only(C, int(i), drop_first=drop_first_antidiag)
+        except Exception:
+            continue
+
+        if y_a.size >= 16:
+            f_peak, f_lo, f_hi, period, period_lo, period_hi, df = fft_peak_with_bin_uncertainty(
+                y_a,
+                dt_fft_anti,
+                fmin=fmin,
+                fmax=fmax,
+                detrend=detrend,
+                window=window,
+            )
+            if np.isfinite(period) and period > 0:
+                raw_period_anti[k] = float(period)
+
+        # --- horizontal y ---
+        try:
+            y_h = extract_horizontal_lineout_y_only(C, int(i), drop_first=drop_first_horizontal)
+        except Exception:
+            continue
+
+        if y_h.size >= 16:
+            f_peak, f_lo, f_hi, period, period_lo, period_hi, df = fft_peak_with_bin_uncertainty(
+                y_h,
+                dt_fft_horz,
+                fmin=fmin,
+                fmax=fmax,
+                detrend=detrend,
+                window=window,
+            )
+            if np.isfinite(period) and period > 0:
+                raw_period_horz[k] = float(period)
+
+    # ------------------------------------------------------------
+    # Step 2: smooth by pooling ±half_window neighbors
+    #         and compute robust band from quantiles
+    #         (EXACTLY the same structure as your working function)
+    # ------------------------------------------------------------
+    half_window = int(max(0, half_window))
+
+    def smooth_with_quantile_band(raw: np.ndarray):
+        smooth = np.full_like(raw, np.nan, dtype=float)
+        band_lo = np.full_like(raw, np.nan, dtype=float)
+        band_hi = np.full_like(raw, np.nan, dtype=float)
+
+        alpha = (1.0 - float(band_ci)) / 2.0
+        q_lo = alpha
+        q_hi = 1.0 - alpha
+
+        for kk in range(len(start_idxs)):
+            a = max(0, kk - half_window)
+            b = min(len(start_idxs), kk + half_window + 1)
+
+            window_vals = raw[a:b]
+            window_vals = window_vals[np.isfinite(window_vals)]
+            if window_vals.size < 3:
+                continue
+
+            smooth[kk] = float(np.median(window_vals))
+            band_lo[kk] = float(np.quantile(window_vals, q_lo))
+            band_hi[kk] = float(np.quantile(window_vals, q_hi))
+
+        return smooth, band_lo, band_hi
+
+    smooth_anti, blo_anti, bhi_anti = smooth_with_quantile_band(raw_period_anti)
+    smooth_horz, blo_horz, bhi_horz = smooth_with_quantile_band(raw_period_horz)
+
+    # Convert start idx -> seconds
+    starts_s = start_idxs.astype(float) * float(dt_s)
+
+    # For plotting, keep indices where at least one curve is finite
+    m_any = np.isfinite(smooth_anti) | np.isfinite(smooth_horz)
+    start_idxs_used = start_idxs[m_any]
+    starts_s_used = starts_s[m_any]
+
+    # --- plot ---
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.1, 1.0], wspace=0.35)
+
+    # Left: TTC with start points
+    ax0 = fig.add_subplot(gs[0])
+    im = ax0.imshow(Cplot, origin="lower", cmap=cmap, interpolation="nearest")
+    ax0.set_xlabel("t₁ index")
+    ax0.set_ylabel("t₂ index")
+    ax0.set_title(f"{SAMPLE_ID} mask {MASK_N} TTC + diagonal start positions")
+    ax0.plot(start_idxs_used, start_idxs_used, "o", ms=3.5, color="C2", alpha=0.9)
+    fig.colorbar(im, ax=ax0, fraction=0.046)
+
+    # Right: both periods + bands
+    ax1 = fig.add_subplot(gs[1])
+
+    # anti-diagonal (C2)
+    mA = np.isfinite(smooth_anti) & np.isfinite(blo_anti) & np.isfinite(bhi_anti)
+    ax1.plot(starts_s[mA], smooth_anti[mA], lw=2.4, color="C2", label=f"anti-diag median over ±{half_window}")
+    ax1.fill_between(
+        starts_s[mA],
+        blo_anti[mA],
+        bhi_anti[mA],
+        color="C2",
+        alpha=0.22,
+        linewidth=0,
+        label=f"anti-diag {int(band_ci*100)}% window band",
+    )
+
+    # horizontal (C0)
+    mH = np.isfinite(smooth_horz) & np.isfinite(blo_horz) & np.isfinite(bhi_horz)
+    ax1.plot(starts_s[mH], smooth_horz[mH], lw=2.4, color="C0", label=f"horizontal median over ±{half_window}")
+    ax1.fill_between(
+        starts_s[mH],
+        blo_horz[mH],
+        bhi_horz[mH],
+        color="C0",
+        alpha=0.18,
+        linewidth=0,
+        label=f"horizontal {int(band_ci*100)}% window band",
+    )
+
+    ax1.set_title(f"{SAMPLE_ID} M{MASK_N} peak periods vs diagonal start time")
+    ax1.set_xlabel("Diagonal start time  (t = start_idx · dt_s)  [s]")
+    ax1.set_ylabel("Peak period  [s]")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=9)
+
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "start_idx": start_idxs_used,
+        "start_time_s": starts_s_used,
+        # raw
+        "anti_period_raw_s": raw_period_anti,
+        "horz_period_raw_s": raw_period_horz,
+        # smoothed + bands
+        "anti_period_smooth_s": smooth_anti[m_any],
+        "anti_band_lo_s": blo_anti[m_any],
+        "anti_band_hi_s": bhi_anti[m_any],
+        "horz_period_smooth_s": smooth_horz[m_any],
+        "horz_band_lo_s": blo_horz[m_any],
+        "horz_band_hi_s": bhi_horz[m_any],
+        # bookkeeping
+        "dt_fft_anti_used_s": dt_fft_anti,
+        "dt_fft_horz_used_s": dt_fft_horz,
+        "half_window": half_window,
+        "band_ci": band_ci,
+    }
 
 
 # ============================================================
-# Main
+# Execution functions
 # ============================================================
 
-BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
-SAMPLE_ID = "A073"
-MASK_N = 145
+def cosine_fitting_test():
 
-if __name__ == "__main__":
     # If your TTC time step is known (seconds per TTC index step), set dt_s appropriately.
     DT_S = 1.0
 
@@ -1249,65 +1607,32 @@ if __name__ == "__main__":
 
     # Example: constrain possible periods
     # period ~100 s => omega ~ 2π/100 ~ 0.0628 rad/s
-    # fit = extract_fit_antidiagonal_with_ttc_plot(
-    #     SAMPLE_ID,
-    #     BASE_DIR,
-    #     mask_n=MASK_N,
-    #     start_time_idx=START_DIAG_IDX,
-    #     dt_s=DT_S,
-    #     omega_min=2 * np.pi / 500.0,  # periods up to 500 s
-    #     omega_max=2 * np.pi / 20.0,   # periods down to 20 s
-    #     n_omega=260,
-    #     n_tau=120,
-    #     despike_at_start=True,
-    #     despike_halfwidth=1,
-    #     use_weights=True,
-    # )
-
-
-    # If you also want the multi-lineout plot:
-    # data = load_xpcs_arrays(SAMPLE_ID, BASE_DIR, mask_n=MASK_N)
-    # plot_ttc_with_lineouts(data, start=START_DIAG_IDX, add_antidiag_se=True, despike_at_start=True, despike_halfwidth=1)
-
-    DT_S = 1.0
-    START_DIAG_IDX = 2000
-
-    data = load_xpcs_arrays(SAMPLE_ID, BASE_DIR, mask_n=MASK_N)
-
-    # --- extract lineout ---
-    t, y = extract_antidiagonal_lineout(
-        data.ttc,
-        start_idx=START_DIAG_IDX,
+    fit = extract_fit_antidiagonal_with_ttc_plot(
+        SAMPLE_ID,
+        BASE_DIR,
+        mask_n=MASK_N,
+        start_time_idx=START_DIAG_IDX,
         dt_s=DT_S,
+        omega_min=2 * np.pi / 500.0,  # periods up to 500 s
+        omega_max=2 * np.pi / 20.0,  # periods down to 20 s
+        n_omega=260,
+        n_tau=120,
+        despike_at_start=True,
+        despike_halfwidth=1,
+        use_weights=True,
     )
 
-    # --- bootstrap FFT peak ---
-    # fmin, fmax = 1 / 1000, 1 / 10  # Hz
-    #
-    # f_hat, f_lo, f_hi, f_samp = bootstrap_peak_frequency(
-    #     y, DT_S,
-    #     fmin=fmin,
-    #     fmax=fmax,
-    #     seg_len=None,  # auto
-    #     overlap=0.5,
-    #     window="hann",
-    #     detrend=True,
-    #     n_boot=2000,
-    #     ci=0.68,
-    #     rng_seed=1,
-    # )
-    #
-    #
-    # print(f"Peak frequency: {f_hat:.6g} Hz  (68% CI [{f_lo:.6g}, {f_hi:.6g}])")
-    # print(f"Period: {1 / f_hat:.2f} s  (CI [{1 / f_hi:.2f}, {1 / f_lo:.2f}] s)")
+def plot_of_lineout_directions():
 
-    # drop_first = 5
-    # dt_lineout = DT_S * 2.0  # because tau = 2*k*dt_s along anti-diagonal
-    # f_peak, sf, T, sT, df = fft_peak_with_bin_uncertainty(y, dt_lineout, drop_first=drop_first)
-    #
-    # print(f"FFT peak: {f_peak:.6g} Hz")
-    # print(f"Bin spacing Δf = {df:.3g} Hz  -> σ_f ≈ {sf:.3g} Hz")
-    # print(f"Period: {T:.2f} s  -> σ_T ≈ {sT:.2f} s")
+    START_DIAG_IDX = 2500
+
+    # If you also want the multi-lineout plot:
+    data = load_xpcs_arrays(SAMPLE_ID, BASE_DIR, mask_n=MASK_N)
+    plot_ttc_with_lineouts(data, start=START_DIAG_IDX, add_antidiag_se=True, despike_at_start=True, despike_halfwidth=1)
+
+
+def plot_of_period_vs_diagonal_start():
+    DT_S = 1.0
 
     data = load_xpcs_arrays(SAMPLE_ID, BASE_DIR, mask_n=MASK_N)
 
@@ -1323,12 +1648,51 @@ if __name__ == "__main__":
         window="hann",
     )
 
-    # out = plot_ttc_lineout_fft(
-    #     data,
-    #     start_idx=START_DIAG_IDX,
-    #     dt_s=DT_S,
-    #     drop_first=5,     # try 0, 5, 10
-    #     detrend=True,
-    #     window=True,
-    # )
-    # print("Peak period (s):", out["period_s"])
+def plot_of_single_fft_antidiagonal_lineout():
+
+    START_DIAG_IDX = 2500
+
+    DT_S = 1.0
+
+    data = load_xpcs_arrays(SAMPLE_ID, BASE_DIR, mask_n=MASK_N)
+
+    out = plot_ttc_lineout_fft(
+        data,
+        start_idx=START_DIAG_IDX,
+        dt_s=DT_S,
+        drop_first=5,  # try 0, 5, 10
+        detrend=True,
+        window=True,
+    )
+
+def plot_of_period_vs_diagonal_start_both_lineouts():
+    DT_S = 1.0
+
+    data = load_xpcs_arrays(SAMPLE_ID, BASE_DIR, mask_n=MASK_N)
+
+    out = plot_period_vs_diagonal_start_both_lineouts(
+        data,
+        dt_s=DT_S,
+        drop_first_antidiag=5,
+        drop_first_horizontal=0,
+        half_window=5,  # set 0 for no smoothing
+        fmin=1 / 1000,
+        fmax=1 / 10,
+        detrend=True,
+        window="hann",
+    )
+
+
+BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
+SAMPLE_ID = "A073"
+MASK_N = 114
+
+if __name__ == "__main__":
+
+    # cosine_fitting_test()
+    # plot_of_lineout_directions()
+    # plot_of_period_vs_diagonal_start()
+    # plot_of_single_fft_antidiagonal_lineout()
+    plot_of_period_vs_diagonal_start_both_lineouts()
+
+    pass
