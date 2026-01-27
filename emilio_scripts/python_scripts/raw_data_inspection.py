@@ -385,23 +385,448 @@ def crop_around_center(img2d, cy: int, cx: int, *, crop_h: int = 100, crop_w: in
 
     return img2d[y0:y1, x0:x1], (y0, y1, x0, x1)
 
+def inspect_raw_mask_oscillations(
+    run: RunData,
+    *,
+    mask_signal: int,
+    mask_control: int,
+    dt_s: float = 1.0,
+    fmin: float = 1 / 1000,
+    fmax: float = 1 / 10,
+    detrend: bool = True,
+    window: bool = True,
+    figsize=(12.5, 7.0),
+):
+    """
+    Compare raw-intensity oscillations between a signal ROI and a control ROI.
 
-# Example usage (inside your __main__ after you have `run = load_run_data(...)`):
-# launch_masked_raw_viewer(run, mask_n=MASK_N, start_frame=0, clip_percentile_init=99.9)
+    Uses raw detector frames (run.dset_raw) and dynamic_roi_map.
+    """
+
+    dset = run.dset_raw
+    n_frames = int(dset.shape[0])
+    t = np.arange(n_frames) * float(dt_s)
+
+    # --- build masks ---
+    mask_sig, used_sig = _make_roi_boolean_mask(run.dynamic_roi_map, mask_signal)
+    mask_ctl, used_ctl = _make_roi_boolean_mask(run.dynamic_roi_map, mask_control)
+
+    # --- extract summed intensity traces ---
+    y_sig = np.zeros(n_frames, dtype=np.float64)
+    y_ctl = np.zeros(n_frames, dtype=np.float64)
+
+    for i in range(n_frames):
+        frame = dset[i, :, :]
+        y_sig[i] = np.sum(frame[mask_sig])
+        y_ctl[i] = np.sum(frame[mask_ctl])
+
+    # --- preprocessing helper ---
+    def preprocess_and_fft(y):
+        y = y.astype(np.float64)
+        y = y - np.mean(y)
+
+        if detrend:
+            A = np.column_stack([t, np.ones_like(t)])
+            beta, *_ = np.linalg.lstsq(A, y, rcond=None)
+            y = y - (A @ beta)
+
+        if window:
+            y = y * np.hanning(len(y))
+
+        F = np.fft.rfft(y)
+        freqs = np.fft.rfftfreq(len(y), d=dt_s)
+        power = np.abs(F) ** 2
+
+        m = (freqs >= fmin) & (freqs <= fmax)
+        return y, freqs[m], power[m]
+
+    y_sig_p, f_sig, P_sig = preprocess_and_fft(y_sig)
+    y_ctl_p, f_ctl, P_ctl = preprocess_and_fft(y_ctl)
+
+    # --- plotting ---
+    fig, axs = plt.subplots(2, 2, figsize=figsize)
+
+    axs[0, 0].plot(t, y_sig_p, lw=1.4, color="C3")
+    axs[0, 0].set_title(f"Signal mask {used_sig} (raw intensity)")
+    axs[0, 0].set_xlabel("Time [s]")
+    axs[0, 0].set_ylabel("Intensity (a.u.)")
+
+    axs[0, 1].plot(t, y_ctl_p, lw=1.4, color="0.3")
+    axs[0, 1].set_title(f"Control mask {used_ctl} (raw intensity)")
+    axs[0, 1].set_xlabel("Time [s]")
+
+    axs[1, 0].plot(f_sig, P_sig, lw=1.8, color="C3")
+    axs[1, 0].set_yscale("log")
+    axs[1, 0].set_xlabel("Frequency [Hz]")
+    axs[1, 0].set_ylabel("Power")
+
+    axs[1, 1].plot(f_ctl, P_ctl, lw=1.8, color="0.3")
+    axs[1, 1].set_yscale("log")
+    axs[1, 1].set_xlabel("Frequency [Hz]")
+
+    for ax in axs.flat:
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "signal": {"t": t, "y": y_sig, "freqs": f_sig, "power": P_sig},
+        "control": {"t": t, "y": y_ctl, "freqs": f_ctl, "power": P_ctl},
+    }
+
+
+def extract_roi_intensity_matrix(
+    dset_raw,
+    *,
+    dynamic_roi_map=None,
+    mask_n: int | None = None,
+    roi_mask=None,
+    start: int = 0,
+    stop: int | None = None,
+    stride: int = 1,
+    dtype=np.float32,
+):
+    """
+    Build the per-pixel intensity matrix for one ROI from the raw frames.
+
+    Returns
+    -------
+    I : (T, P) array
+        I[t, p] is the intensity of ROI pixel p at time/frame t.
+        T is number of selected frames, P is number of ROI pixels.
+    frame_idxs : (T,) array
+        The raw frame indices used (accounts for start/stop/stride).
+
+    Notes
+    -----
+    - You may pass either:
+        (A) roi_mask= (bool 2D array), OR
+        (B) dynamic_roi_map= (int 2D array) AND mask_n= (ROI label)
+      If roi_mask is provided, it is used directly.
+    - Reads frames lazily from the HDF5 dataset (no full load).
+    """
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+
+    n_frames = int(dset_raw.shape[0])
+    if stop is None:
+        stop = n_frames
+    start = int(np.clip(start, 0, n_frames))
+    stop = int(np.clip(stop, 0, n_frames))
+    if stop <= start:
+        raise ValueError(f"Invalid frame range: start={start}, stop={stop}")
+
+    # --- resolve ROI mask ---
+    if roi_mask is not None:
+        m = np.asarray(roi_mask).astype(bool, copy=False)
+        if m.ndim != 2:
+            raise ValueError(f"roi_mask must be 2D, got shape {m.shape}")
+    else:
+        if dynamic_roi_map is None or mask_n is None:
+            raise ValueError("Provide either roi_mask=..., or (dynamic_roi_map=... and mask_n=...)")
+        m, _ = _make_roi_boolean_mask(dynamic_roi_map, int(mask_n))  # uses your existing helper
+
+    P = int(np.sum(m))
+    if P <= 0:
+        raise ValueError("ROI mask has zero pixels")
+
+    frame_idxs = np.arange(start, stop, stride, dtype=int)
+    T = int(frame_idxs.size)
+
+    # Preallocate output: (T, P)
+    I = np.empty((T, P), dtype=dtype)
+
+    # Read each frame lazily and vectorize ROI pixels
+    for j, fi in enumerate(frame_idxs):
+        frame = dset_raw[int(fi), :, :]
+        I[j, :] = np.asarray(frame)[m].astype(dtype, copy=False)
+
+    return I, frame_idxs
+
+
+def ttc_corr_and_g_from_I(I: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute Corr-TTC and G-TTC from intensity matrix I (T, P),
+    where averaging is over pixels.
+
+    Corr(t1,t2) = <I(t1)I(t2)> / (<I(t1)><I(t2)>)
+    G(t1,t2)    = (<I(t1)I(t2)> - <I(t1)><I(t2)>) / (sigma(t1)sigma(t2))
+
+    Returns (Corr, G), each shape (T, T).
+    """
+    I = np.asarray(I, dtype=np.float64)
+    T, P = I.shape
+    if T < 2 or P < 2:
+        raise ValueError(f"Need at least 2 frames and 2 pixels, got I={I.shape}")
+
+    # <I(t)> over pixels
+    mu = I.mean(axis=1)  # (T,)
+
+    # <I(t1)I(t2)> over pixels:
+    # mean over pixels of product = (I @ I.T) / P
+    cross = (I @ I.T) / float(P)  # (T,T)
+
+    # Corr TTC
+    denom_corr = mu[:, None] * mu[None, :]
+    Corr = cross / np.where(denom_corr == 0, np.nan, denom_corr)
+
+    # G TTC
+    var = (I * I).mean(axis=1) - mu * mu
+    var = np.clip(var, 0.0, np.inf)
+    sigma = np.sqrt(var)  # (T,)
+    denom_g = sigma[:, None] * sigma[None, :]
+    G = (cross - denom_corr) / np.where(denom_g == 0, np.nan, denom_g)
+
+    return Corr, G
+
+
+def symmetrize_ttc(C: np.ndarray) -> np.ndarray:
+    C = np.asarray(C, dtype=np.float64)
+    return C + C.T - np.diag(np.diag(C))
+
+
+def clip_ttc(C: np.ndarray, p_hi: float = 99.9) -> np.ndarray:
+    C = np.asarray(C, dtype=np.float64)
+    lo, hi = np.nanpercentile(C, [0.0, float(p_hi)])
+    return np.clip(C, lo, hi)
+
+
+def plot_corr_vs_g_ttc(
+    Corr: np.ndarray,
+    G: np.ndarray,
+    *,
+    clip_hi_percentile: float = 99.9,
+    cmap: str = "plasma",
+    figsize=(13.0, 4.6),
+):
+    """
+    Side-by-side:
+      Left: Corr-TTC (symmetrized, clipped)
+      Mid : G-TTC    (symmetrized, clipped)
+      Right: (G - (Corr - 1)) as a diagnostic map
+
+    The diagnostic uses the fully coherent / stable mean relation:
+      G ≈ Corr - 1   (see their discussion around eqs. 3–4)  [oai_citation:2‡Ragulskaya et al. - 2024 - On the analysis of two-time correlation functions equilibrium versus non-equilibrium systems.pdf](sediment://file_00000000923c71f88df245b998ba4918)
+    """
+    Cc = symmetrize_ttc(Corr)
+    Cg = symmetrize_ttc(G)
+
+    Cc_plot = clip_ttc(Cc, p_hi=clip_hi_percentile)
+    Cg_plot = clip_ttc(Cg, p_hi=clip_hi_percentile)
+
+    # Diagnostic map: how far from G = Corr - 1
+    D = Cg - (Cc - 1.0)
+    D_plot = clip_ttc(D, p_hi=clip_hi_percentile)
+
+    fig, axs = plt.subplots(1, 3, figsize=figsize, gridspec_kw={"wspace": 0.30})
+
+    im0 = axs[0].imshow(Cc_plot, origin="lower", cmap=cmap, interpolation="nearest", aspect="equal")
+    axs[0].set_title("Corr-TTC")
+    axs[0].set_xlabel("t₁ index")
+    axs[0].set_ylabel("t₂ index")
+    fig.colorbar(im0, ax=axs[0], fraction=0.046)
+
+    im1 = axs[1].imshow(Cg_plot, origin="lower", cmap=cmap, interpolation="nearest", aspect="equal")
+    axs[1].set_title("G-TTC")
+    axs[1].set_xlabel("t₁ index")
+    axs[1].set_ylabel("t₂ index")
+    fig.colorbar(im1, ax=axs[1], fraction=0.046)
+
+    im2 = axs[2].imshow(D_plot, origin="lower", cmap="magma", interpolation="nearest", aspect="equal")
+    axs[2].set_title("Diagnostic:  G - (Corr - 1)")
+    axs[2].set_xlabel("t₁ index")
+    axs[2].set_ylabel("t₂ index")
+    fig.colorbar(im2, ax=axs[2], fraction=0.046)
+
+    plt.tight_layout()
+    plt.show()
+
+def _slice_to_start_stop_stride(frame_slice: slice | None, n_frames: int) -> tuple[int, int, int]:
+    """
+    Convert a Python slice into (start, stop, stride) with bounds clipped to [0, n_frames].
+
+    Examples
+    --------
+    None             -> (0, n_frames, 1)
+    slice(0, 4800)   -> (0, 4800, 1)
+    slice(100, 2000, 2) -> (100, 2000, 2)
+    """
+    if frame_slice is None:
+        return 0, int(n_frames), 1
+
+    start = 0 if frame_slice.start is None else int(frame_slice.start)
+    stop = n_frames if frame_slice.stop is None else int(frame_slice.stop)
+    stride = 1 if frame_slice.step is None else int(frame_slice.step)
+
+    if stride == 0:
+        raise ValueError("slice.step cannot be 0")
+
+    # Clip to valid range
+    start = max(0, min(int(n_frames), start))
+    stop = max(0, min(int(n_frames), stop))
+
+    # Ensure forward slicing (you can add reverse support later if you want)
+    if stride < 0:
+        raise ValueError("Negative slice.step not supported here. Use positive step.")
+
+    if stop <= start:
+        raise ValueError(f"Empty frame_slice after clipping: start={start}, stop={stop}, n_frames={n_frames}")
+
+    return start, stop, stride
+
+def compare_ttc_methods_from_raw(
+    run: RunData,
+    *,
+    mask_n: int,
+    frame_slice: slice | None = None,
+    clip_hi_percentile: float = 99.9,
+):
+    """
+    Build I(t,p) from raw frames for ROI mask_n, compute Corr and G TTCs, and plot.
+
+    Uses your existing functions:
+      - extract_roi_intensity_matrix(...)
+      - ttc_corr_and_g_from_I(...)
+      - plot_corr_vs_g_ttc(...)
+    """
+    n_frames = int(run.dset_raw.shape[0])
+    start, stop, stride = _slice_to_start_stop_stride(frame_slice, n_frames)
+
+    I, frame_idxs = extract_roi_intensity_matrix(
+        run.dset_raw,
+        dynamic_roi_map=run.dynamic_roi_map,
+        mask_n=int(mask_n),
+        start=start,
+        stop=stop,
+        stride=stride,
+    )
+
+    Corr, G = ttc_corr_and_g_from_I(I)
+
+    plot_corr_vs_g_ttc(
+        Corr,
+        G,
+        clip_hi_percentile=clip_hi_percentile,
+    )
+
+    return {
+        "I": I,
+        "frame_idxs": frame_idxs,
+        "Corr": Corr,
+        "G": G,
+    }
+
+def compare_existing_processed_ttc_with_corr_from_raw(
+    run: RunData,
+    *,
+    mask_n: int,
+    frame_slice: slice | None = None,
+    clip_hi_percentile: float = 99.9,
+    diff_symmetric: bool = True,
+    cmap: str = "plasma",
+    figsize=(14.2, 4.8),
+):
+    """
+    Side-by-side comparison:
+
+      [0] Existing processed TTC (run.ttc)
+      [1] Corr TTC computed directly from raw frames for the same ROI
+      [2] Difference map: Corr - Existing
+
+    Notes
+    -----
+    - We compute Corr on a selected set of frames (frame_slice).
+    - We compare to the corresponding submatrix of the processed TTC using those same frame indices.
+    - By default, we symmetrize the maps for plotting (your preference).
+    """
+    # ---- compute Corr from raw for requested frames ----
+    n_frames = int(run.dset_raw.shape[0])
+    start, stop, stride = _slice_to_start_stop_stride(frame_slice, n_frames)
+
+    I, frame_idxs = extract_roi_intensity_matrix(
+        run.dset_raw,
+        dynamic_roi_map=run.dynamic_roi_map,
+        mask_n=int(mask_n),
+        start=start,
+        stop=stop,
+        stride=stride,
+    )
+
+    Corr, _G = ttc_corr_and_g_from_I(I)  # we only need Corr here
+
+    # ---- pull matching submatrix from existing processed TTC ----
+    C_exist = np.asarray(run.ttc, dtype=np.float64)
+    if C_exist.ndim != 2 or C_exist.shape[0] != C_exist.shape[1]:
+        raise ValueError(f"run.ttc must be square, got {C_exist.shape}")
+
+    # frame_idxs refer to raw frames. We assume processed TTC uses the same frame indexing.
+    # So we take the corresponding rows/cols.
+    if np.max(frame_idxs) >= C_exist.shape[0]:
+        raise ValueError(
+            f"Processed TTC size {C_exist.shape[0]} is smaller than max frame index {np.max(frame_idxs)}. "
+            f"Check whether processed TTC was computed on fewer frames than raw."
+        )
+
+    C_exist_sub = C_exist[np.ix_(frame_idxs, frame_idxs)]
+
+    # ---- symmetrize (optional) ----
+    if diff_symmetric:
+        C_exist_sub = symmetrize_ttc(C_exist_sub)
+        Corr = symmetrize_ttc(Corr)
+
+    D = Corr - C_exist_sub
+    if diff_symmetric:
+        D = symmetrize_ttc(D)
+
+    # ---- clip for display ----
+    C0 = clip_ttc(C_exist_sub, p_hi=clip_hi_percentile)
+    C1 = clip_ttc(Corr, p_hi=clip_hi_percentile)
+    Dp = clip_ttc(D, p_hi=clip_hi_percentile)
+
+    # ---- plot ----
+    fig, axs = plt.subplots(1, 3, figsize=figsize, gridspec_kw={"wspace": 0.28})
+
+    im0 = axs[0].imshow(C0, origin="lower", cmap=cmap, interpolation="nearest", aspect="equal")
+    axs[0].set_title("Existing processed TTC (submatrix)")
+    axs[0].set_xlabel("t₁ index")
+    axs[0].set_ylabel("t₂ index")
+    fig.colorbar(im0, ax=axs[0], fraction=0.046)
+
+    im1 = axs[1].imshow(C1, origin="lower", cmap=cmap, interpolation="nearest", aspect="equal")
+    axs[1].set_title("Corr TTC from raw")
+    axs[1].set_xlabel("t₁ index")
+    axs[1].set_ylabel("t₂ index")
+    fig.colorbar(im1, ax=axs[1], fraction=0.046)
+
+    im2 = axs[2].imshow(Dp, origin="lower", cmap="magma", interpolation="nearest", aspect="equal")
+    axs[2].set_title("Difference: Corr - Existing")
+    axs[2].set_xlabel("t₁ index")
+    axs[2].set_ylabel("t₂ index")
+    fig.colorbar(im2, ax=axs[2], fraction=0.046)
+
+    for ax in axs:
+        ax.grid(False)
+
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "frame_idxs": frame_idxs,
+        "I": I,
+        "Corr": Corr,
+        "Existing_sub": C_exist_sub,
+        "Diff": D,
+    }
 
 
 # ============================================================
-# User parameters / entry point
+# Execution functions
 # ============================================================
 
-BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006")
-SAMPLE_ID = "A073"
-MASK_N = 145
+def data_structure_viewer():
 
-if __name__ == "__main__":
     run = load_run_data(BASE_DIR, SAMPLE_ID, mask_n=MASK_N)
-
-    launch_masked_raw_viewer(run, mask_n=MASK_N, start_frame=0, clip_percentile_init=99.9)
 
     print("Loaded:")
     print("  raw:", run.raw_path)
@@ -413,6 +838,76 @@ if __name__ == "__main__":
     print("  ttc:", run.ttc.shape, run.ttc.dtype)
     print("  g2:", run.g2.shape, run.g2.dtype)
 
-    # Keep run.f_raw / run.f_meta open for later steps.
-    # When you're done:
-    # run.close()
+    run.close()
+
+def mask_roi_viewer():
+
+    run = load_run_data(BASE_DIR, SAMPLE_ID, mask_n=MASK_N)
+
+    launch_masked_raw_viewer(run, mask_n=MASK_N, start_frame=0, clip_percentile_init=99.9)
+
+    run.close()
+
+def raw_mask_oscillation_inspector():
+
+    run = load_run_data(BASE_DIR, SAMPLE_ID, mask_n=MASK_N)
+
+    inspect_raw_mask_oscillations(
+        run,
+        mask_signal=MASK_N,
+        mask_control=CONTROL_MASK_N,
+        dt_s=1.0,
+        fmin=1 / 1000,
+        fmax=1 / 10,
+        detrend=True,
+        window=True,
+    )
+
+    run.close()
+
+
+def comparison_of_corr_and_g_ttc_plot_methods():
+    run = load_run_data(BASE_DIR, SAMPLE_ID, mask_n=MASK_N)
+
+    out = compare_ttc_methods_from_raw(
+        run,
+        mask_n=MASK_N,
+        frame_slice=slice(0, 4800),  # or None for all frames
+        clip_hi_percentile=99.9,
+    )
+
+    run.close()
+
+def compare_existing_vs_corr_entrypoint():
+
+    run = load_run_data(BASE_DIR, SAMPLE_ID, mask_n=MASK_N)
+    try:
+        return compare_existing_processed_ttc_with_corr_from_raw(
+            run,
+            mask_n=MASK_N,
+            frame_slice=slice(0, 4800),  # or None
+            clip_hi_percentile=99.9,
+            diff_symmetric=True,
+        )
+    finally:
+        run.close()
+
+
+# ============================================================
+# User parameters / entry point
+# ============================================================
+
+BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006")
+SAMPLE_ID = "A073"
+MASK_N = 145
+CONTROL_MASK_N = 3
+
+if __name__ == "__main__":
+
+    # data_structure_viewer()
+    mask_roi_viewer()
+    # raw_mask_oscillation_inspector()
+    # comparison_of_corr_and_g_ttc_plot_methods()
+    # compare_existing_vs_corr_entrypoint()
+
+    pass

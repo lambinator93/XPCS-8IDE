@@ -390,9 +390,34 @@ def figure_upload():
     image_upload(fig, target_cell="AF142", upload_name="run123_overview.png")
     plt.close(fig)
 
+def q_spacing_inspector(filename):
+    with h5py.File(filename, "r") as f:
+        dynamic_roi_map = f["xpcs/qmap/dynamic_roi_map"][...]
+        scattering_2d = f["xpcs/temporal_mean/scattering_2d"][...]
+        ttc = f["xpcs/twotime/correlation_map/c2_00194"][...]
+        g2 = f["xpcs/twotime/normalized_g2"][...]
+        q = f["xpcs/qmap/dynamic_v_list_dim0"][...]
+        phi = f["xpcs/qmap/dynamic_v_list_dim1"][...]
+
+    run_name = os.path.basename(h5_file).split("_")[0]
 
 
-file_ID = 'A013'
+    scattering_2d_reshape = scattering_2d[0, :, :]
+    individual_mask_intensity = []
+
+    print('q:', q)
+
+    print('phi:', phi)
+
+    for i in range(9):
+        print(q[i + 1] - q[i])
+
+    for j in range(29):
+        print(phi[j + 1] - phi[j])
+
+
+
+file_ID = 'A073'
 
 if file_ID == 'A013':
     filename = (r'/Users/emilioescauriza/Desktop/A013_IPA_NBH_1_att0100_079K_001_results.hdf')
@@ -404,7 +429,7 @@ h5_file = filename
 
 if __name__ == "__main__":
 
-    h5_file_inspector(h5_file)
+    # h5_file_inspector(h5_file)
     # g2_plotter(h5_file)
     # ttc_plotter(h5_file)
     # intensity_vs_time(h5_file)
@@ -413,5 +438,7 @@ if __name__ == "__main__":
     # oauth_test()
     # image_upload()
     # figure_upload()
+    q_spacing_inspector(h5_file)
+
 
     pass

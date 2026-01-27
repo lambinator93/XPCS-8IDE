@@ -12,6 +12,8 @@ import matplotlib as mpl
 mpl.use("macosx")  # must be set before importing pyplot
 import matplotlib.pyplot as plt
 
+import re
+
 
 # ============================================================
 # File finding + loading
@@ -1423,6 +1425,18 @@ def plot_period_vs_diagonal_start_both_lineouts(
     C = symmetrize_ttc(data.ttc)
     Cplot = clip_ttc(C, p_hi=float(clip_hi_percentile))
 
+    def block_average(C, out_n=300):
+        """
+        Downsample a square matrix C to out_n x out_n by block averaging.
+        """
+        n = C.shape[0]
+        m = n // out_n
+        C = C[:out_n * m, :out_n * m]  # trim
+        return C.reshape(out_n, m, out_n, m).mean(axis=(1, 3))
+
+    C_small = block_average(Cplot, out_n=300)
+    np.savetxt(SAMPLE_ID + 'M' + str(MASK_N) + '.txt', C_small, fmt="%.3f")
+
     n = C.shape[0]
     if start_idxs is None:
         lo = int(0.05 * (n - 1))
@@ -1592,6 +1606,755 @@ def plot_period_vs_diagonal_start_both_lineouts(
         "band_ci": band_ci,
     }
 
+def plot_ttc_and_2dfft(
+    ttc: np.ndarray,
+    *,
+    clip_hi_percentile: float = 99.9,
+    dt_s: float = 1.0,
+    cmap_ttc: str = "plasma",
+    cmap_fft: str = "magma",
+    window: bool = True,
+    remove_mean: bool = True,
+    figsize=(12.5, 5.5),
+):
+    """
+    Side-by-side plot:
+      Left : symmetrized TTC
+      Right: log-power 2D FFT of TTC
+
+    Parameters
+    ----------
+    ttc : (N,N) array
+        Two-time correlation matrix.
+    clip_hi_percentile : float
+        Upper percentile clipping for TTC display.
+    dt_s : float
+        Time step per TTC index (seconds), used for frequency axes.
+    window : bool
+        Apply 2D Hann window before FFT to suppress edge leakage.
+    remove_mean : bool
+        Subtract mean of TTC before FFT (highly recommended).
+    """
+
+    # -----------------------------
+    # TTC preprocessing
+    # -----------------------------
+    C = symmetrize_ttc(ttc)
+    Cplot = clip_ttc(C, p_hi=float(clip_hi_percentile))
+
+    N = C.shape[0]
+
+    # -----------------------------
+    # FFT preprocessing
+    # -----------------------------
+    X = C.astype(np.float64)
+
+    if remove_mean:
+        X = X - np.nanmean(X)
+
+    X = np.nan_to_num(X, nan=0.0)
+
+    if window:
+        w = np.hanning(N)
+        W = w[:, None] * w[None, :]
+        X = X * W
+
+    # # remove row/column means (kills separable terms)
+    # X = (
+    #         X
+    #         - X.mean(axis=0, keepdims=True)
+    #         - X.mean(axis=1, keepdims=True)
+    #         + X.mean()
+    # )
+
+    # 2D FFT
+    F = np.fft.fftshift(np.fft.fft2(X))
+    P = np.abs(F) ** 2
+
+    # frequency axes (Hz)
+    f = np.fft.fftshift(np.fft.fftfreq(N, d=dt_s))
+
+    # --------------------------------
+    # restrict FFT display range
+    # --------------------------------
+    fmax = 0.01  # Hz
+    m = (f >= -fmax) & (f <= fmax)
+
+    f_zoom = f[m]
+    P_zoom = P[np.ix_(m, m)]
+
+    # masks in FFT space
+    eps = 1e-12
+
+    # axis masks
+    axis_mask = (np.abs(f_zoom[:, None]) < eps) | (np.abs(f_zoom[None, :]) < eps)
+
+    # diagonal (f1 + f2 = 0)
+    F1, F2 = np.meshgrid(f_zoom, f_zoom, indexing="ij")
+    diag_mask = np.abs(F1 + F2) < (2 * (f_zoom[1] - f_zoom[0]))
+
+    axis_power = np.sum(P_zoom[axis_mask])
+    diag_power = np.sum(P_zoom[diag_mask])
+
+    print(f"Axis power     : {axis_power:.3e}")
+    print(f"Diagonal power : {diag_power:.3e}")
+    print(f"Ratio A_s/A_d ≈ {axis_power / diag_power:.3f}")
+
+    # -----------------------------
+    # Plot
+    # -----------------------------
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.30)
+
+    # ---- TTC ----
+    ax0 = fig.add_subplot(gs[0])
+    im0 = ax0.imshow(
+        Cplot,
+        origin="lower",
+        cmap=cmap_ttc,
+        interpolation="nearest",
+        aspect="equal",
+    )
+    ax0.set_title("TTC (symmetrized)")
+    ax0.set_xlabel("t₁ index")
+    ax0.set_ylabel("t₂ index")
+    fig.colorbar(im0, ax=ax0, fraction=0.046)
+
+    # ---- 2D FFT ----
+    ax1 = fig.add_subplot(gs[1])
+    im1 = ax1.imshow(
+        np.log10(P_zoom + 1e-12),
+        origin="lower",
+        extent=[f_zoom[0], f_zoom[-1], f_zoom[0], f_zoom[-1]],
+        cmap=cmap_fft,
+        aspect="equal",
+    )
+    ax1.set_title("2D FFT power  (log scale)")
+    ax1.set_xlabel("f₁  [Hz]")
+    ax1.set_ylabel("f₂  [Hz]")
+    fig.colorbar(im1, ax=ax1, fraction=0.046)
+
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "ttc_sym": C,
+        "fft_power": P,
+        "freqs_hz": f,
+    }
+
+# -----------------------------
+# TTC utilities
+# -----------------------------
+def symmetrize_ttc(ttc: np.ndarray) -> np.ndarray:
+    ttc = np.asarray(ttc, dtype=np.float64)
+    return ttc + ttc.T - np.diag(np.diag(ttc))
+
+
+def clip_ttc(C: np.ndarray, p_hi: float = 99.9) -> np.ndarray:
+    lo, hi = np.percentile(C[np.isfinite(C)], [0.0, p_hi])
+    return np.clip(C, lo, hi)
+
+
+def maybe_window_2d(X: np.ndarray, window: bool) -> np.ndarray:
+    if not window:
+        return X
+    n = X.shape[0]
+    w = np.hanning(n)
+    W = w[:, None] * w[None, :]
+    return X * W
+
+
+# -----------------------------
+# Model
+# -----------------------------
+def make_time_axes(n: int, dt_s: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Return t1,t2 grids in seconds, shape (n,n).
+    We use t = idx * dt_s.
+    """
+    t = np.arange(n, dtype=np.float64) * float(dt_s)
+    t1 = t[None, :]  # columns
+    t2 = t[:, None]  # rows
+    return t1, t2
+
+
+def model_ttc(
+    n: int,
+    dt_s: float,
+    *,
+    C0: float,
+    A_d: float,
+    A_s: float,
+    omega_d: float,
+    omega_s: float,
+) -> np.ndarray:
+    t1, t2 = make_time_axes(n, dt_s)
+    return (
+        C0
+        + A_d * np.cos(omega_d * (t2 - t1))
+        + A_s * np.cos(omega_s * t1) * np.cos(omega_s * t2)
+    )
+
+
+def fit_amplitudes_linear(
+    C: np.ndarray,
+    dt_s: float,
+    *,
+    omega_d: float,
+    omega_s: float,
+    weights: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """
+    Given omega_d, omega_s, solve for (C0, A_d, A_s) by (weighted) least squares.
+
+    C ~ C0 + A_d * Bd + A_s * Bs
+    where:
+      Bd = cos(omega_d*(t2-t1))
+      Bs = cos(omega_s*t1)*cos(omega_s*t2)
+    """
+    C = np.asarray(C, dtype=np.float64)
+    n = C.shape[0]
+    t1, t2 = make_time_axes(n, dt_s)
+
+    Bd = np.cos(omega_d * (t2 - t1))
+    Bs = np.cos(omega_s * t1) * np.cos(omega_s * t2)
+
+    y = C.reshape(-1)
+
+    A = np.column_stack(
+        [
+            np.ones_like(y),
+            Bd.reshape(-1),
+            Bs.reshape(-1),
+        ]
+    )
+
+    if weights is not None:
+        w = np.asarray(weights, dtype=np.float64).reshape(-1)
+        w = np.clip(w, 0.0, np.inf)
+        sw = np.sqrt(w)
+        Aw = A * sw[:, None]
+        yw = y * sw
+        coeff, *_ = np.linalg.lstsq(Aw, yw, rcond=None)
+    else:
+        coeff, *_ = np.linalg.lstsq(A, y, rcond=None)
+
+    C0, A_d, A_s = (float(coeff[0]), float(coeff[1]), float(coeff[2]))
+    return {"C0": C0, "A_d": A_d, "A_s": A_s}
+
+
+def sse_for_omegas(
+    C: np.ndarray,
+    dt_s: float,
+    omega_d: float,
+    omega_s: float,
+    *,
+    weights: Optional[np.ndarray] = None,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Compute SSE after solving amplitudes at (omega_d, omega_s).
+    """
+    params = fit_amplitudes_linear(C, dt_s, omega_d=omega_d, omega_s=omega_s, weights=weights)
+    C0, A_d, A_s = params["C0"], params["A_d"], params["A_s"]
+    C_hat = model_ttc(C.shape[0], dt_s, C0=C0, A_d=A_d, A_s=A_s, omega_d=omega_d, omega_s=omega_s)
+
+    R = C - C_hat
+    if weights is None:
+        sse = float(np.sum(R * R))
+    else:
+        W = np.asarray(weights, dtype=np.float64)
+        sse = float(np.sum(W * R * R))
+    return sse, params
+
+
+# -----------------------------
+# FFT-based initial guesses
+# -----------------------------
+def fft2d_power(
+    C: np.ndarray,
+    dt_s: float,
+    *,
+    remove_mean: bool = True,
+    window: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return (f_hz, P, F) where:
+      f_hz: 1D frequency axis (Hz), fftshifted, length N
+      P:    2D power spectrum |F|^2, shape (N,N), fftshifted
+      F:    complex 2D FFT (fftshifted)
+    """
+    X = np.asarray(C, dtype=np.float64)
+    X = np.nan_to_num(X, nan=0.0)
+
+    if remove_mean:
+        X = X - float(np.mean(X))
+
+    X = maybe_window_2d(X, window=window)
+
+    F = np.fft.fftshift(np.fft.fft2(X))
+    P = np.abs(F) ** 2
+    f_hz = np.fft.fftshift(np.fft.fftfreq(X.shape[0], d=float(dt_s)))
+    return f_hz, P, F
+
+
+def guess_omega_d_from_diag_ridge(
+    C: np.ndarray,
+    dt_s: float,
+    *,
+    fmax_hz: float = 0.02,
+    diag_band_hz: Optional[float] = None,
+) -> float:
+    """
+    Estimate omega_d by collapsing power along the diagonal ridge f1 + f2 ~ const.
+    For cos(omega_d*(t2-t1)), the FFT is concentrated near f1 = -f2 = ±f_d,
+    i.e. the anti-diagonal (f1 + f2 = 0) with peaks away from 0.
+
+    We approximate by sampling power along the anti-diagonal line (i, N-1-i).
+    """
+    f, P, _ = fft2d_power(C, dt_s, remove_mean=True, window=True)
+    n = len(f)
+
+    # zoom mask
+    m = (f >= -fmax_hz) & (f <= fmax_hz)
+    idx = np.flatnonzero(m)
+    if idx.size < 8:
+        raise ValueError("FFT zoom band too small for this N/dt_s")
+
+    Pz = P[np.ix_(idx, idx)]
+    fz = f[idx]
+    nz = fz.size
+
+    # anti-diagonal samples (f1 = -f2)
+    anti = np.array([Pz[i, nz - 1 - i] for i in range(nz)], dtype=np.float64)
+
+    # ignore the exact center (near DC)
+    center = nz // 2
+    anti[center] = 0.0
+
+    k = int(np.argmax(anti))
+    f_peak = float(abs(fz[k]))
+    omega_d = float(2.0 * np.pi * f_peak)
+    return omega_d
+
+
+def guess_omega_s_from_axis_ridge(
+    C: np.ndarray,
+    dt_s: float,
+    *,
+    fmax_hz: float = 0.02,
+) -> float:
+    """
+    Estimate omega_s by looking for peaks along the axes (f1=±f_s at f2~0 or vice versa).
+    For cos(w t1)cos(w t2), FFT has components at (±f_s, ±f_s) and (±f_s, ∓f_s),
+    but in practice you often see strong low-frequency axis structure.
+    We do a simple 1D collapse near f2=0 and pick the strongest non-DC peak.
+    """
+    f, P, _ = fft2d_power(C, dt_s, remove_mean=True, window=True)
+    n = len(f)
+
+    m = (f >= -fmax_hz) & (f <= fmax_hz)
+    idx = np.flatnonzero(m)
+    if idx.size < 8:
+        raise ValueError("FFT zoom band too small for this N/dt_s")
+
+    Pz = P[np.ix_(idx, idx)]
+    fz = f[idx]
+    nz = fz.size
+
+    # take a small band around f2=0 (central rows) and collapse over it
+    c = nz // 2
+    band = 2  # +/- 2 bins around 0
+    r0 = max(0, c - band)
+    r1 = min(nz, c + band + 1)
+
+    axis_profile = np.mean(Pz[r0:r1, :], axis=0)
+    axis_profile[c] = 0.0  # remove DC
+
+    k = int(np.argmax(axis_profile))
+    f_peak = float(abs(fz[k]))
+    omega_s = float(2.0 * np.pi * f_peak)
+    return omega_s
+
+
+# -----------------------------
+# Main fit routine
+# -----------------------------
+@dataclass
+class FitResult:
+    C0: float
+    A_d: float
+    A_s: float
+    omega_d: float
+    omega_s: float
+    sse: float
+
+
+def fit_ttc_four_params(
+    ttc: np.ndarray,
+    *,
+    dt_s: float = 1.0,
+    downsample: int = 1,
+    # FFT guess params
+    fmax_guess_hz: float = 0.02,
+    # search params (Hz, converted to omega)
+    fd_span_hz: float = 0.004,
+    fs_span_hz: float = 0.004,
+    n_fd: int = 45,
+    n_fs: int = 45,
+    refine_rounds: int = 2,
+) -> FitResult:
+    """
+    Fit (A_d, A_s, omega_d, omega_s) + C0.
+
+    Strategy:
+      - symmetrize TTC (default)
+      - optional downsample for speed (fit on smaller matrix)
+      - FFT-based initial guesses for omega_d, omega_s
+      - coarse-to-fine grid search around those frequencies
+      - amplitudes solved exactly by linear LS for each (omega_d, omega_s)
+    """
+    C = symmetrize_ttc(ttc)
+
+    if downsample > 1:
+        C = C[::downsample, ::downsample]
+
+    # remove any NaNs safely
+    C = np.nan_to_num(C, nan=float(np.nanmean(C)))
+
+    # initial guesses from FFT
+    w_d0 = guess_omega_d_from_diag_ridge(C, dt_s * downsample, fmax_hz=fmax_guess_hz)
+    w_s0 = guess_omega_s_from_axis_ridge(C, dt_s * downsample, fmax_hz=fmax_guess_hz)
+
+    # work in Hz for search ranges, convert to omega each evaluation
+    f_d0 = w_d0 / (2.0 * np.pi)
+    f_s0 = w_s0 / (2.0 * np.pi)
+
+    best = FitResult(C0=float(np.mean(C)), A_d=0.0, A_s=0.0, omega_d=w_d0, omega_s=w_s0, sse=np.inf)
+
+    fd_span = float(fd_span_hz)
+    fs_span = float(fs_span_hz)
+
+    for _round in range(int(refine_rounds)):
+        fd_grid = np.linspace(max(0.0, f_d0 - fd_span), f_d0 + fd_span, int(n_fd))
+        fs_grid = np.linspace(max(0.0, f_s0 - fs_span), f_s0 + fs_span, int(n_fs))
+
+        for fd in fd_grid:
+            omega_d = float(2.0 * np.pi * fd)
+            for fs in fs_grid:
+                omega_s = float(2.0 * np.pi * fs)
+
+                sse, amps = sse_for_omegas(C, dt_s * downsample, omega_d, omega_s, weights=None)
+
+                if sse < best.sse:
+                    best = FitResult(
+                        C0=amps["C0"],
+                        A_d=amps["A_d"],
+                        A_s=amps["A_s"],
+                        omega_d=omega_d,
+                        omega_s=omega_s,
+                        sse=sse,
+                    )
+
+        # re-center and shrink spans for refinement
+        f_d0 = best.omega_d / (2.0 * np.pi)
+        f_s0 = best.omega_s / (2.0 * np.pi)
+        fd_span *= 0.35
+        fs_span *= 0.35
+
+    return best
+
+
+# -----------------------------
+# Plotting
+# -----------------------------
+def plot_measured_vs_model_ttc(
+    ttc: np.ndarray,
+    fit: FitResult,
+    *,
+    dt_s: float = 1.0,
+    clip_hi_percentile: float = 99.9,
+    cmap: str = "plasma",
+    figsize: Tuple[float, float] = (12.5, 5.8),
+):
+    C_meas = symmetrize_ttc(ttc)
+    C_mod = model_ttc(
+        C_meas.shape[0],
+        dt_s,
+        C0=fit.C0,
+        A_d=fit.A_d,
+        A_s=fit.A_s,
+        omega_d=fit.omega_d,
+        omega_s=fit.omega_s,
+    )
+    # keep model symmetrized too (numerically should already be)
+    C_mod = symmetrize_ttc(C_mod)
+
+    C_meas_plot = clip_ttc(C_meas, p_hi=float(clip_hi_percentile))
+    C_mod_plot = clip_ttc(C_mod, p_hi=float(clip_hi_percentile))
+
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.28)
+
+    ax0 = fig.add_subplot(gs[0])
+    im0 = ax0.imshow(C_meas_plot, origin="lower", cmap=cmap, interpolation="nearest", aspect="equal")
+    ax0.set_title("Measured TTC (symmetrized)")
+    ax0.set_xlabel("t₁ index")
+    ax0.set_ylabel("t₂ index")
+    fig.colorbar(im0, ax=ax0, fraction=0.046)
+
+    ax1 = fig.add_subplot(gs[1])
+    im1 = ax1.imshow(C_mod_plot, origin="lower", cmap=cmap, interpolation="nearest", aspect="equal")
+    ax1.set_title("Model TTC (fitted)")
+    ax1.set_xlabel("t₁ index")
+    ax1.set_ylabel("t₂ index")
+    fig.colorbar(im1, ax=ax1, fraction=0.046)
+
+    plt.tight_layout()
+    plt.show()
+
+    return {"C_meas_sym": C_meas, "C_model_sym": C_mod}
+
+
+# -----------------------------
+# Example usage
+# -----------------------------
+def demo_with_random():
+    # synthetic demo (sanity check)
+    n = 420
+    dt_s = 1.0
+    true = dict(C0=1.0, A_d=0.15, A_s=0.08, omega_d=2 * np.pi / 110.0, omega_s=2 * np.pi / 95.0)
+    C = model_ttc(n, dt_s, **true)
+    C = C + 0.02 * np.random.default_rng(0).standard_normal(C.shape)
+
+    fit = fit_ttc_four_params(C, dt_s=dt_s, downsample=2, fmax_guess_hz=0.02)
+    print("Fit:")
+    print(f"  C0     = {fit.C0:.6g}")
+    print(f"  A_d    = {fit.A_d:.6g}")
+    print(f"  A_s    = {fit.A_s:.6g}")
+    print(f"  omega_d= {fit.omega_d:.6g} rad/s  (T_d={2*np.pi/fit.omega_d:.2f} s)")
+    print(f"  omega_s= {fit.omega_s:.6g} rad/s  (T_s={2*np.pi/fit.omega_s:.2f} s)")
+    print(f"  SSE    = {fit.sse:.6g}")
+
+    plot_measured_vs_model_ttc(C, fit, dt_s=dt_s, clip_hi_percentile=99.5)
+
+def _safe_decode(x):
+    try:
+        if isinstance(x, (bytes, np.bytes_)):
+            return x.decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    return x
+
+
+def _get_temperature_from_results_hdf(hdf_path):
+    """
+    Best-effort temperature fetcher. Returns float or None.
+    Tries multiple common locations and attributes.
+    """
+    candidate_paths = [
+        "experimental_parameters/temperature",
+        "experimental_parameters/T",
+        "experiment/temperature",
+        "metadata/temperature",
+        "entry/sample/temperature",
+        "entry/instrument/sample/temperature",
+        "entry/sample/temperature_setpoint",
+        "entry/sample/temperature_actual",
+    ]
+
+    with h5py.File(hdf_path, "r") as f:
+        # Try datasets
+        for p in candidate_paths:
+            if p in f:
+                try:
+                    v = f[p][()]
+                    v = np.asarray(v).squeeze()
+                    if v.size == 1:
+                        return float(v)
+                except Exception:
+                    pass
+
+        # Try attrs on some likely groups
+        for grp_name in ("entry", "entry/sample", "experimental_parameters", "metadata"):
+            if grp_name in f:
+                g = f[grp_name]
+                for k in ("temperature", "Temperature", "T", "temp", "Temp"):
+                    if k in g.attrs:
+                        try:
+                            v = _safe_decode(g.attrs[k])
+                            return float(np.asarray(v).squeeze())
+                        except Exception:
+                            pass
+
+    return None
+
+
+def find_brightest_mask_by_integrated_intensity(dynamic_roi_map, scattering_2d):
+    """
+    Pick the mask label with the largest integrated intensity in scattering_2d.
+
+    dynamic_roi_map: 2D integer label image
+    scattering_2d:    2D intensity image (same shape)
+
+    Returns
+    -------
+    best_label : int
+    best_sum   : float
+    """
+    lab = np.asarray(dynamic_roi_map)
+    img = np.asarray(scattering_2d)
+
+    if lab.ndim != 2 or img.ndim != 2 or lab.shape != img.shape:
+        raise ValueError(f"Shape mismatch: roi_map {lab.shape}, scattering_2d {img.shape}")
+
+    # labels present (exclude background 0 if it exists)
+    labels = np.unique(lab)
+    labels = labels[labels != 0]
+
+    best_label = None
+    best_sum = -np.inf
+
+    # brute-force but fine for ~300 masks
+    for k in labels:
+        m = (lab == k)
+        s = float(np.nansum(img[m]))
+        if s > best_sum:
+            best_sum = s
+            best_label = int(k)
+
+    if best_label is None:
+        raise ValueError("No nonzero ROI labels found in dynamic_roi_map")
+
+    return best_label, best_sum
+
+
+def plot_A4_17scan_central_brightest_ttcs(
+    *,
+    base_dir,
+    sample_ids,
+    clip_hi_percentile=99.9,
+    cmap="plasma",
+    figsize_per_panel=(2.1, 2.3),
+    title_fontsize=9,
+    textbox_fontsize=8,
+):
+    """
+    One very wide figure: 17 TTC panels in a row.
+
+    For each scan:
+      - load dynamic_roi_map + scattering_2d from results hdf
+      - choose brightest mask by integrated intensity
+      - load TTC for that mask
+      - symmetrize
+      - display clipped (optional)
+      - annotate with temperature + textbox M<mask> min/max
+
+    Assumes your existing helpers exist:
+      - find_results_hdf(base_dir, sample_id)
+      - symmetrize_ttc(C)
+      - clip_ttc(C, p_hi=...)
+    """
+    sample_ids = list(sample_ids)
+    n_panels = len(sample_ids)
+
+    # Very wide figure
+    fig_w = float(figsize_per_panel[0]) * n_panels
+    fig_h = float(figsize_per_panel[1])
+    fig, axs = plt.subplots(1, n_panels, figsize=(fig_w, fig_h), squeeze=False)
+    axs = axs[0]
+
+    # To keep comparable visual scaling across all panels, we can compute global clim
+    # from the *clipped* versions, but textbox uses unclipped min/max.
+    Cplots = []
+    panel_meta = []
+
+    for sid in sample_ids:
+        hdf_path = find_results_hdf(Path(base_dir), sid)
+
+        # load the bits needed to pick mask and load TTC
+        with h5py.File(hdf_path, "r") as f:
+            roi_map = f["xpcs/qmap/dynamic_roi_map"][...]
+            scat = f["xpcs/temporal_mean/scattering_2d"][...]
+            if scat.ndim == 3:
+                scat = scat[0, :, :]
+
+            mask_n, _ = find_brightest_mask_by_integrated_intensity(roi_map, scat)
+
+            mask_n = mask_n + 2
+
+            ttc_path = f"xpcs/twotime/correlation_map/c2_00{int(mask_n):03d}"
+            if ttc_path not in f:
+                raise KeyError(f"Missing TTC path {ttc_path} in {hdf_path}")
+
+            C = f[ttc_path][...]
+
+        # symmetrize by default (your preference)
+        Csym = symmetrize_ttc(C)
+
+        # min/max for textbox from *unclipped* symmetrized data
+        cmin = float(np.nanmin(Csym))
+        cmax = float(np.nanmax(Csym))
+
+        # clip only for display (to avoid one panel dominating colormap)
+        Cplot = clip_ttc(Csym, p_hi=float(clip_hi_percentile))
+        Cplots.append(Cplot)
+
+        T = _get_temperature_from_results_hdf(hdf_path)
+        panel_meta.append((sid, mask_n, T, cmin, cmax))
+
+    ims = []
+    for ax, Cplot, meta in zip(axs, Cplots, panel_meta):
+        sid, mask_n, T, cmin, cmax = meta
+
+        im = ax.imshow(
+            Cplot,
+            origin="lower",
+            cmap=cmap,
+            interpolation="nearest",
+            aspect="equal",
+        )
+        ims.append(im)
+
+        hdf_path = find_results_hdf(Path(base_dir), sid)
+        temp_str = temperature_str_from_filename(hdf_path)
+
+        if temp_str is None:
+            ax.set_title(f"{sid}", fontsize=title_fontsize)
+        else:
+            ax.set_title(f"{sid} | {temp_str}", fontsize=title_fontsize)
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        # Textbox: mask + min/max from UNCLIPPED symmetrized matrix
+        txt = f"M{int(mask_n)}\nmin={cmin:.3g}\nmax={cmax:.3g}"
+        ax.text(
+            0.02, 0.98, txt,
+            transform=ax.transAxes,
+            va="top", ha="left",
+            fontsize=textbox_fontsize,
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.85, edgecolor="0.5"),
+        )
+
+    # # One shared colorbar (since we forced shared vmin/vmax)
+    # cbar = fig.colorbar(ims[-1], ax=axs, fraction=0.015, pad=0.01)
+    # cbar.set_label("TTC (clipped for display)")
+    #
+    # fig.suptitle(f"A4: central brightest-mask TTCs (n={n_panels})", y=1.02, fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+    return panel_meta
+
+def temperature_str_from_filename(hdf_path):
+    """
+    Extract e.g. '080K' from ..._080K_..._results.hdf
+    """
+    name = Path(hdf_path).name
+    m = re.search(r"_([0-9]{2,4}K)_", name)
+    return m.group(1) if m else None
+
 
 # ============================================================
 # Execution functions
@@ -1682,10 +2445,73 @@ def plot_of_period_vs_diagonal_start_both_lineouts():
         window="hann",
     )
 
+def fft_2d_plot():
+
+    data = load_xpcs_arrays(SAMPLE_ID, BASE_DIR, mask_n=MASK_N)
+
+    plot_ttc_and_2dfft(
+        data.ttc,
+        dt_s=1.0,
+        clip_hi_percentile=99.9,
+    )
+
+def fft_2d_fitting_and_parameter_extraction():
+
+    # # Demo with random data:
+    # demo_with_random()
+
+    # Replace this with your TTC array:
+    data = load_xpcs_arrays(SAMPLE_ID, BASE_DIR, mask_n=MASK_N)
+    ttc = data.ttc
+
+    # Then:
+    fit = fit_ttc_four_params(ttc, dt_s=1.0, downsample=5)
+    plot_measured_vs_model_ttc(ttc, fit, dt_s=1.0, clip_hi_percentile=99.5)
+
+def read_sample_temperature(f_meta: h5py.File) -> float | None:
+    """
+    Try common temperature fields and return value in K if found.
+    """
+    candidates = [
+        "entry/sample/qnw1_temperature",
+        "entry/sample/qnw_lakeshore",
+        "entry/sample/qnw2_temperature",
+    ]
+
+    for path in candidates:
+        if path in f_meta:
+            val = f_meta[path][()]
+            try:
+                return float(val)
+            except Exception:
+                pass
+
+    return None
+
+
+def plot_A4_17scan_central_brightest_ttcs_entrypoint():
+    """
+    Execution wrapper you can call from if __name__ == "__main__":.
+    Uses your stated list.
+    """
+    scans = [
+        "A010","A017","A023","A029","A036","A042","A048","A053","A063",
+        "A073","A078","A083","A088","A093","A098","A101","A104",
+    ]
+    return plot_A4_17scan_central_brightest_ttcs(
+        base_dir=BASE_DIR,
+        sample_ids=scans,
+        clip_hi_percentile=99.9,
+        cmap="plasma",
+        figsize_per_panel=(2.0, 2.25),
+        title_fontsize=9,
+        textbox_fontsize=8,
+    )
+
 
 BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
 SAMPLE_ID = "A073"
-MASK_N = 114
+MASK_N = 144
 
 if __name__ == "__main__":
 
@@ -1693,6 +2519,10 @@ if __name__ == "__main__":
     # plot_of_lineout_directions()
     # plot_of_period_vs_diagonal_start()
     # plot_of_single_fft_antidiagonal_lineout()
-    plot_of_period_vs_diagonal_start_both_lineouts()
+    # plot_of_period_vs_diagonal_start_both_lineouts()
+    # fft_2d_plot()
+    # fft_2d_fitting_and_parameter_extraction()
+    plot_A4_17scan_central_brightest_ttcs_entrypoint()
+
 
     pass
