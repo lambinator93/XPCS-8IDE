@@ -2201,8 +2201,8 @@ def ttc_with_custom_mask():
         base_dir=BASE_DIR,
         sample_id=SAMPLE_ID,
         mask_n_for_loading=MASK_N,      # only used to load run/scattering/results paths
-        r_inner_px=10.0,
-        r_outer_px=15.0,
+        r_inner_px=140.0,
+        r_outer_px=150.0,
         center_px=(1198, 216),  # (cx, cy) or None to auto-detect
         bright_percentile=99.9,
         shape='semi',  # "semi" or "circle"
@@ -2227,7 +2227,7 @@ def integrated_intensities_inspector():
 # BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006")
 BASE_DIR = Path("/Users/emilioescauriza/Desktop")
 SAMPLE_ID = "A073"
-MASK_N = 145
+MASK_N = 144
 CONTROL_MASK_N = 176
 
 if __name__ == "__main__":
@@ -2240,7 +2240,7 @@ if __name__ == "__main__":
     # compare_existing_vs_corr_entrypoint()
     # compare_existing_ttc_and_cgpt_ttc_from_raw()
     # compare_existing_ttc_and_ttc_from_raw()
-    # ttc_with_custom_mask()
+    ttc_with_custom_mask()
 
 
     pass
