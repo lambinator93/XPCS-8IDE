@@ -1009,7 +1009,7 @@ def plot_bragg_peak_shape_metrics_overlay_from_maps(
     fig, ax = plt.subplots(1, 1, figsize=(7.4, 6.2))
     im = ax.imshow(
         img,
-        origin="lower",
+        origin="upper",
         cmap=cmap,
         norm=norm,
         interpolation="nearest",
@@ -1019,7 +1019,6 @@ def plot_bragg_peak_shape_metrics_overlay_from_maps(
     ax.set_title("Detector-space scattering_2d with q/phi contour overlay")
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.invert_yaxis()
     ax.set_facecolor("black")
 
     # Contour levels chosen from valid pixels
@@ -1043,18 +1042,25 @@ def plot_bragg_peak_shape_metrics_overlay_from_maps(
     q_mean = float(metrics.get("q_mean"))
     phi_mean = float(metrics.get("phi_mean_rad"))
 
-    dphi = phv - phi_mean
-    dphi = (dphi + np.pi) % (2.0 * np.pi) - np.pi
-    dq = qv - q_mean
-    dist2 = dq * dq + dphi * dphi
+    vv = valid  # or your ROI mask if you have one
+    w = np.clip(img[vv], 0.0, None)
 
-    # Find pixel index of min dist2
-    flat_valid_idx = np.flatnonzero(valid)
-    best_flat = flat_valid_idx[int(np.argmin(dist2))]
-    cy, cx = np.unravel_index(best_flat, img.shape)
+    iy, ix = np.nonzero(vv)
+    sw = float(np.sum(w))
+    if sw <= 0:
+        raise RuntimeError("No positive weight for centroid.")
+
+    cx = float(np.sum(w * ix) / sw)
+    cy = float(np.sum(w * iy) / sw)
 
     ax.plot([cx], [cy], marker="x", markersize=10, mew=2)
-    ax.text(cx + 10, cy + 10, f"(q̄, φ̄)\nq={q_mean:.4f}\nφ={phi_mean:.4f} rad", fontsize=9, color="blue")
+    ax.text(
+        cx + 200,
+        cy + 50,
+        f"Pixel centroid (x̄,ȳ)\nq̄={q_mean:.4f}\nφ̄={phi_mean:.4f} rad",
+        fontsize=12,
+        color="yellow",
+    )
 
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03, label="log10(Intensity + eps)")
     fig.tight_layout()
@@ -1166,6 +1172,12 @@ def bragg_peak_shape_metrics_fixed_q_phi_from_maps(
         img = img[0]
     img = np.asarray(img, dtype=np.float64)
 
+    H, W = img.shape
+    iy_max, ix_max = np.unravel_index(np.nanargmax(img), img.shape)
+    print("argmax (ix, iy):", ix_max, iy_max)
+    print("argmax display-y if origin='lower':", (H - 1 - iy_max))
+    print("img max:", img[iy_max, ix_max])
+
     q_map = np.asarray(q_map, dtype=np.float64)
     phi_map = np.asarray(phi_map, dtype=np.float64)
 
@@ -1195,6 +1207,17 @@ def bragg_peak_shape_metrics_fixed_q_phi_from_maps(
     # freeze the mask used for pixel-space moments
     vv_used = vv.copy()
 
+    iy0, ix0 = np.unravel_index(np.nanargmax(img), img.shape)
+
+    half_w = 250  # tune
+    half_h = 250  # tune
+    roi = np.zeros_like(vv_used, dtype=bool)
+    y0, x0 = iy0, ix0
+    roi[max(0, y0 - half_h):min(img.shape[0], y0 + half_h + 1),
+    max(0, x0 - half_w):min(img.shape[1], x0 + half_w + 1)] = True
+
+    vv_used = vv_used & roi
+
     w = img[vv_used].copy()
 
     # Weights must be non-negative for moment interpretation
@@ -1207,8 +1230,8 @@ def bragg_peak_shape_metrics_fixed_q_phi_from_maps(
     if not np.isfinite(sw) or sw <= eps:
         raise RuntimeError("Sum of weights is zero or non-finite, cannot compute moments.")
 
-    qv = q_map[vv]
-    ph = phi_map[vv]
+    qv = q_map[vv_used]
+    ph = phi_map[vv_used]
 
     # ---- weighted mean in q
     q_mean = float(np.sum(w * qv) / sw)
@@ -1238,8 +1261,8 @@ def bragg_peak_shape_metrics_fixed_q_phi_from_maps(
     skew_phi = float(mu3_phi / (mu2_phi ** 1.5 + eps))
 
     # Optional extra diagnostics that are often useful
-    peak_adu = float(np.nanmax(img[vv]))
-    n_pix = int(np.sum(vv))
+    peak_adu = float(np.nanmax(img[vv_used]))
+    n_pix = int(np.sum(vv_used))
     frac_kept = float(n_pix / np.sum(valid)) if np.sum(valid) > 0 else float("nan")
 
     # ----------------------------
@@ -1261,6 +1284,10 @@ def bragg_peak_shape_metrics_fixed_q_phi_from_maps(
     skew_x = np.sum(w * (ix - x_mean) ** 3) / (w_sum * sigma_x ** 3)
     skew_y = np.sum(w * (iy - y_mean) ** 3) / (w_sum * sigma_y ** 3)
 
+    H, W = img.shape
+    print("argmax array (x,y):", ix0, iy0, " display-y:", (H - 1) - iy0)
+    print("centroid array (x,y):", x_mean, y_mean, " display-y:", (H - 1) - y_mean)
+
     return {
         "x_mean_px": float(x_mean),
         "y_mean_px": float(y_mean),
@@ -1279,6 +1306,8 @@ def bragg_peak_shape_metrics_fixed_q_phi_from_maps(
         "peak_intensity": peak_adu,
         "hot_z_thresh": float(hot_z_thresh),
     }
+
+
 
 def exec_bragg_peak_shape_metrics_fixed_q_phi():
 
@@ -1310,19 +1339,6 @@ def exec_bragg_peak_shape_metrics_fixed_q_phi():
         valid_mask=d.get("valid_mask", None),
         metrics=metrics,
         cmap="magma",
-    )
-
-    # Print the key numbers (optional)
-    print(
-        "Center (q, phi) = "
-        f"({metrics['center_q']:.6g}, {metrics['center_phi']:.6g})\n"
-        "Sigma  (q, phi) = "
-        f"({metrics['sigma_q']:.6g}, {metrics['sigma_phi']:.6g})\n"
-        "Skew   (q, phi) = "
-        f"({metrics['skew_q']:.6g}, {metrics['skew_phi']:.6g})\n"
-        "Bowley (q, phi) = "
-        f"({metrics['bowley_skew_q']:.6g}, {metrics['bowley_skew_phi']:.6g})\n"
-        f"Neff = {metrics['neff']:.2f}"
     )
 
     return metrics
