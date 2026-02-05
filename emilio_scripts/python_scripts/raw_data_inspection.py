@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from typing import Callable
 
 import h5py
 import hdf5plugin
@@ -13,6 +14,7 @@ mpl.use("macosx")  # must be set before importing pyplot
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button, RadioButtons
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.colors import LogNorm
 
 
 @dataclass
@@ -820,23 +822,1303 @@ def compare_existing_processed_ttc_with_corr_from_raw(
     }
 
 
+def _symmetrize_upper_triangle(C: np.ndarray) -> np.ndarray:
+    """If C is stored as upper triangle, make a full symmetric map."""
+    C = np.asarray(C)
+    return C + C.T - np.diag(np.diag(C))
+
+
+def _compute_ttc_like_twotime(time_series: np.ndarray) -> np.ndarray:
+    """
+    Match twotime.py::calc_normal_twotime()
+
+    time_series: (nframes, npix_in_roi)
+
+    Steps (same as twotime.py):
+      norm_factor = 1/sum(time_series, axis=1) with <=0 guarded
+      c2 = (time_series @ time_series.T) * norm_factor * norm_factor.T * npix
+      return triu(c2)
+    """
+    ts = np.asarray(time_series, dtype=np.float64)
+
+    # norm_factor = 1 / sum_over_pixels_per_frame
+    norm_factor = ts.sum(axis=1)
+    norm_factor[norm_factor <= 0] = 1.0
+    norm_factor = 1.0 / norm_factor  # shape (nframes,)
+
+    # matmul_prod = ts @ ts.T
+    matmul_prod = ts @ ts.T  # (nframes, nframes)
+
+    npix = ts.shape[1]
+    c2 = matmul_prod * norm_factor[:, None] * norm_factor[None, :] * float(npix)
+
+    # twotime yields torch.triu(c2)
+    return np.triu(c2)
+
+
+def _smooth_like_twotime(time_series: np.ndarray) -> np.ndarray:
+    """
+    Match twotime.py::compute_smooth_data() *restricted to one ROI*.
+
+    In twotime.py they do, for each ROI:
+      avg = cache[roi_pixels].mean(dim=0)    (mean over time per pixel)
+      avg[avg <= 0] = 1
+      cache[roi_pixels] /= avg
+
+    For a single ROI time_series (nframes, npix):
+      avg_pix = mean over time for each pixel -> shape (npix,)
+      divide each pixel column by its avg.
+    """
+    ts = np.asarray(time_series, dtype=np.float64)
+    avg_pix = ts.mean(axis=0)
+    avg_pix[avg_pix <= 0] = 1.0
+    return ts / avg_pix[None, :]
+
+
+def _load_processed_ttc(hdf_path: Path, mask_n: int) -> np.ndarray:
+    """
+    Try common TTC dataset naming patterns you've used:
+      - xpcs/twotime/correlation_map/c2_00###   (3 digits)
+      - xpcs/twotime/correlation_map/c2_#####   (5 digits, twotime generator style)
+    """
+    key_candidates = [
+        f"xpcs/twotime/correlation_map/c2_00{int(mask_n):03d}",
+        f"xpcs/twotime/correlation_map/c2_{int(mask_n):05d}",
+    ]
+
+    with h5py.File(hdf_path, "r") as f:
+        for k in key_candidates:
+            if k in f:
+                return f[k][...]
+
+        # If neither matched, give a helpful error listing what exists
+        if "xpcs/twotime/correlation_map" in f:
+            keys = list(f["xpcs/twotime/correlation_map"].keys())
+            keys = sorted(keys)[:50]
+            raise KeyError(
+                f"Could not find processed TTC for mask {mask_n} in {hdf_path}.\n"
+                f"Tried: {key_candidates}\n"
+                f"First keys under xpcs/twotime/correlation_map: {keys}"
+            )
+        else:
+            raise KeyError(
+                f"Missing group xpcs/twotime/correlation_map in {hdf_path}"
+            )
+
+
+def _extract_roi_time_series_from_raw(
+    base_dir: Path,
+    sample_id: str,
+    mask_n: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Extract ROI pixel time series from RAW frames, using ROI map from PROCESSED results.
+
+    Returns
+    -------
+    ts : (nframes, npix)
+        Raw intensities for pixels in ROI across time.
+    flat_idx : (npix,)
+        Flattened pixel indices for the ROI (debugging).
+    """
+    base_dir = Path(base_dir)
+
+    # ---- locate raw + processed ----
+    results_path = find_results_hdf(base_dir, sample_id)   # processed *_results.hdf
+    run_dir = find_raw_run_dir(base_dir, sample_id)        # base_dir/data/<run_name>/
+    raw_path, _meta_path = find_raw_data_files(run_dir)    # raw <run_name>.h5 etc.
+
+    # ---- load ROI map from processed ----
+    with h5py.File(results_path, "r") as f:
+        roi_map = f["xpcs/qmap/dynamic_roi_map"][...]
+
+    roi_map = np.asarray(roi_map)
+    if roi_map.ndim != 2:
+        raise ValueError(f"Unexpected roi_map shape {roi_map.shape} in {results_path}")
+
+    # ---- open raw frames and extract ROI pixels lazily ----
+    with h5py.File(raw_path, "r") as f:
+        if "entry/data/data" not in f:
+            raise KeyError(f"Raw file missing 'entry/data/data': {raw_path}")
+
+        dset = f["entry/data/data"]
+        data_shape = dset.shape
+
+        # normalize raw shape: (nframes, ny, nx) or (nframes,1,ny,nx)
+        if len(data_shape) == 4 and data_shape[1] == 1:
+            nframes, _one, ny, nx = data_shape
+            if roi_map.shape != (ny, nx):
+                raise ValueError(f"roi_map {roi_map.shape} != raw frame {(ny, nx)} in {raw_path}")
+
+            roi_bool = (roi_map == int(mask_n))
+            used = int(mask_n)
+            if not np.any(roi_bool):
+                roi_bool = (roi_map == int(mask_n) - 1)
+                used = int(mask_n) - 1
+            if not np.any(roi_bool):
+                raise ValueError(f"Mask {mask_n} (or {mask_n-1}) selects 0 pixels in roi_map for {results_path}")
+
+            ts = np.empty((int(nframes), int(np.sum(roi_bool))), dtype=np.float64)
+            for i in range(int(nframes)):
+                frame = dset[i, 0, :, :]
+                ts[i, :] = np.asarray(frame)[roi_bool]
+
+        elif len(data_shape) == 3:
+            nframes, ny, nx = data_shape
+            if roi_map.shape != (ny, nx):
+                raise ValueError(f"roi_map {roi_map.shape} != raw frame {(ny, nx)} in {raw_path}")
+
+            roi_bool = (roi_map == int(mask_n))
+            used = int(mask_n)
+            if not np.any(roi_bool):
+                roi_bool = (roi_map == int(mask_n) - 1)
+                used = int(mask_n) - 1
+            if not np.any(roi_bool):
+                raise ValueError(f"Mask {mask_n} (or {mask_n-1}) selects 0 pixels in roi_map for {results_path}")
+
+            ts = np.empty((int(nframes), int(np.sum(roi_bool))), dtype=np.float64)
+            for i in range(int(nframes)):
+                frame = dset[i, :, :]
+                ts[i, :] = np.asarray(frame)[roi_bool]
+
+        else:
+            raise ValueError(f"Unexpected raw dataset shape {data_shape} in {raw_path}")
+
+    flat_idx = np.flatnonzero(roi_bool.reshape(-1))
+    return ts, flat_idx
+
+def find_results_hdf(base_dir: Path, sample_id: str) -> Path:
+    """
+    Processed results live under:
+      <BASE_DIR>/Twotime_PostExpt_01/<SAMPLE_ID>_*_results.hdf
+    """
+    proc_dir = Path(base_dir) / "Twotime_PostExpt_01"
+    pattern = f"{sample_id}_*_results.hdf"
+    matches = sorted(proc_dir.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(f"No results HDF found in {proc_dir} matching {pattern}")
+    return matches[0]
+
+
+def exec_compare_raw_vs_processed_ttc(
+    *,
+    base_dir: Path,
+    sample_id: str,
+    mask_n: int,
+    out_path: Path | None = None,
+    clip_hi_percentile: float = 99.9,
+    cmap_main: str = "plasma",
+    cmap_diff: str = "seismic",
+    show: bool = True,
+    frame_slice: slice | None = None,
+    stride: int = 1,
+):
+    """
+    Execution function (uses your existing readers + helpers only):
+
+      1) load_run_data(...) for raw + processed (same HDF readers you already use)
+      2) extract ROI intensity matrix I(t,p) from raw frames
+      3) compute TTC with the same math as twotime.py (smooth then calc_normal_twotime style)
+      4) compare against the processed TTC from the results file
+      5) plot Raw | Processed | Raw-Processed
+
+    Notes
+    -----
+    - Raw TTC and processed TTC are symmetrized before display.
+    - Raw TTC uses your _smooth_like_twotime() and _compute_ttc_like_twotime().
+    - Display uses percentile clipping (0..clip_hi_percentile) independently for Raw and Processed.
+    """
+    run = load_run_data(Path(base_dir), str(sample_id), mask_n=int(mask_n))
+    try:
+        # ----------------------------
+        # pick frames from raw (optional)
+        # ----------------------------
+        n_frames = int(run.dset_raw.shape[0])
+
+        if frame_slice is None:
+            start, stop = 0, n_frames
+            step = int(stride)
+        else:
+            start = 0 if frame_slice.start is None else int(frame_slice.start)
+            stop = n_frames if frame_slice.stop is None else int(frame_slice.stop)
+            step = int(stride) if frame_slice.step is None else int(frame_slice.step)
+
+        start = int(np.clip(start, 0, n_frames))
+        stop = int(np.clip(stop, 0, n_frames))
+        if step < 1:
+            raise ValueError("stride (step) must be >= 1")
+        if stop <= start:
+            raise ValueError(f"Invalid frame range after clipping: start={start}, stop={stop}, n_frames={n_frames}")
+
+        # ----------------------------
+        # build I(t,p) from raw using your existing ROI map logic
+        # ----------------------------
+        I, frame_idxs = extract_roi_intensity_matrix(
+            run.dset_raw,
+            dynamic_roi_map=run.dynamic_roi_map,
+            mask_n=int(mask_n),
+            start=start,
+            stop=stop,
+            stride=step,
+            dtype=np.float64,
+        )
+
+        # ----------------------------
+        # raw TTC, matching twotime.py math (via your existing helpers)
+        # ----------------------------
+        I_smooth = _smooth_like_twotime(I)
+        C_raw_ut = _compute_ttc_like_twotime(I_smooth)
+        C_raw = _symmetrize_upper_triangle(C_raw_ut)
+
+        # ----------------------------
+        # processed TTC, already loaded by load_run_data for this mask
+        # ----------------------------
+        C_proc_ut = np.asarray(run.ttc, dtype=np.float64)
+
+        # If processed TTC is larger than the raw selection, take the matching submatrix
+        if C_proc_ut.ndim != 2 or C_proc_ut.shape[0] != C_proc_ut.shape[1]:
+            raise ValueError(f"Processed TTC must be square, got {C_proc_ut.shape}")
+
+        if int(np.max(frame_idxs)) >= C_proc_ut.shape[0]:
+            raise ValueError(
+                f"Processed TTC size {C_proc_ut.shape[0]} is smaller than max selected frame index {int(np.max(frame_idxs))}. "
+                f"Either reduce frame_slice, or confirm processed TTC was computed on the same frame count."
+            )
+
+        C_proc_ut_sub = C_proc_ut[np.ix_(frame_idxs, frame_idxs)]
+        C_proc = _symmetrize_upper_triangle(C_proc_ut_sub)
+
+        # ----------------------------
+        # clip for display (independent scaling)
+        # ----------------------------
+        def _clip(C: np.ndarray) -> np.ndarray:
+            lo = np.nanpercentile(C, 0.0)
+            hi = np.nanpercentile(C, float(clip_hi_percentile))
+            return np.clip(C, lo, hi)
+
+        C_raw_plot = _clip(C_raw)
+        C_proc_plot = _clip(C_proc)
+
+        # difference (unclipped, symmetrized)
+        C_diff = C_raw - C_proc
+
+        # ----------------------------
+        # plot
+        # ----------------------------
+        fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.2))
+        ax0, ax1, ax2 = axes
+
+        im0 = ax0.imshow(C_raw_plot, origin="lower", cmap=cmap_main, aspect="equal", interpolation="nearest")
+        ax0.set_title(f"RAW TTC (twotime.py math)\n{sample_id} | M{int(mask_n):03d}")
+        ax0.set_xticks([]); ax0.set_yticks([])
+
+        im1 = ax1.imshow(C_proc_plot, origin="lower", cmap=cmap_main, aspect="equal", interpolation="nearest")
+        ax1.set_title(f"PROCESSED TTC (from results)\n{sample_id} | M{int(mask_n):03d}")
+        ax1.set_xticks([]); ax1.set_yticks([])
+
+        max_abs = float(np.nanmax(np.abs(C_diff)))
+        if not np.isfinite(max_abs) or max_abs == 0:
+            max_abs = 1.0
+
+        im2 = ax2.imshow(
+            C_diff,
+            origin="lower",
+            cmap=cmap_diff,
+            aspect="equal",
+            interpolation="nearest",
+            vmin=-max_abs,
+            vmax=+max_abs,
+        )
+        ax2.set_title(f"DIFF (RAW − PROCESSED)\n{sample_id} | M{int(mask_n):03d}")
+        ax2.set_xticks([]); ax2.set_yticks([])
+
+        # colorbars (keep it minimal like you wanted earlier)
+        fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.03, label="ΔC (a.u.)")
+        fig.tight_layout()
+
+        if out_path is not None:
+            out_path = Path(out_path)
+            fig.savefig(out_path, dpi=250, bbox_inches="tight")
+            print(f"Saved: {out_path}")
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        return {
+            "raw_path": str(run.raw_path),
+            "meta_path": str(run.meta_path),
+            "results_path": str(run.results_path),
+            "sample_id": str(sample_id),
+            "mask_n": int(mask_n),
+            "frame_idxs": frame_idxs,
+            "raw_shape_I": tuple(I.shape),
+            "raw_ttc_shape": tuple(C_raw.shape),
+            "processed_ttc_shape": tuple(C_proc.shape),
+        }
+
+    finally:
+        run.close()
+
+def compare_loaded_ttc_with_twotime_imported_ttc(
+    run: RunData,
+    *,
+    mask_n: int,
+    frame_slice: slice | None = None,
+    stride: int = 1,
+    clip_hi_percentile: float = 99.9,
+    cmap_main: str = "plasma",
+    cmap_diff: str = "seismic",
+    figsize=(15.5, 5.2),
+):
+    """
+    Compare:
+      [0] Loaded processed TTC from results file (run.ttc, submatrix for chosen frames)
+      [1] TTC computed using imported twotime.py logic (TwotimeCorrelator)
+      [2] Difference map: (twotime_imported - loaded)
+
+    Notes
+    -----
+    - Uses your existing readers and ROI extraction.
+    - twotime.py path: must be importable as `import twotime` or `from twotime import TwotimeCorrelator`.
+    - twotime's calc_normal_twotime() is a generator (yields one TTC per dq bin). For one ROI we take the first yield.
+    """
+    import numpy as np
+    import torch
+    from twotime import TwotimeCorrelator
+
+    # ----------------------------
+    # pick frames (optional)
+    # ----------------------------
+    n_frames = int(run.dset_raw.shape[0])
+
+    if frame_slice is None:
+        start, stop = 0, n_frames
+        step = int(stride)
+    else:
+        start = 0 if frame_slice.start is None else int(frame_slice.start)
+        stop = n_frames if frame_slice.stop is None else int(frame_slice.stop)
+        step = int(stride) if frame_slice.step is None else int(frame_slice.step)
+
+    start = int(np.clip(start, 0, n_frames))
+    stop = int(np.clip(stop, 0, n_frames))
+    if step < 1:
+        raise ValueError("stride (step) must be >= 1")
+    if stop <= start:
+        raise ValueError(f"Invalid frame range after clipping: start={start}, stop={stop}, n_frames={n_frames}")
+
+    # ----------------------------
+    # build I(t,p) from raw frames (your existing method)
+    # ----------------------------
+    I, frame_idxs = extract_roi_intensity_matrix(
+        run.dset_raw,
+        dynamic_roi_map=run.dynamic_roi_map,
+        mask_n=int(mask_n),
+        start=start,
+        stop=stop,
+        stride=step,
+        dtype=np.float32,
+    )
+    T, P = I.shape
+
+    # ----------------------------
+    # twotime.py TTC via imported functions/classes
+    # ----------------------------
+    # TwotimeCorrelator expects:
+    #   cache shape = (frame_num, arr_size)
+    #   dq_slc list of slices over columns; for a single ROI we use slice(0, P)
+    qinfo = {
+        "dq_idx": np.array([0], dtype=np.int32),
+        "dq_slc": [slice(0, P)],
+        "sq_idx": np.array([0], dtype=np.int32),
+        "sq_slc": [slice(0, P)],
+    }
+
+    corr = TwotimeCorrelator(
+        qinfo=qinfo,
+        frame_num=T,
+        det_size=run.dynamic_roi_map.shape,  # not actually used in normal mode TTC math, but required
+        device="cpu",
+        method="normal",
+        dtype=torch.float32,
+    )
+
+    # load raw ROI matrix into correlator cache
+    corr.process(torch.from_numpy(I))
+
+    # apply the same smoothing step twotime.py uses
+    corr.compute_smooth_data()
+
+    # calc_normal_twotime() yields TTC per dq bin (generator)
+    gen = corr.calc_normal_twotime()
+    C_tw_ut_obj = next(gen)  # first (and only) ROI/dq
+    if hasattr(C_tw_ut_obj, "detach"):
+        # torch tensor case
+        C_tw_ut = C_tw_ut_obj.detach().cpu().numpy()
+    else:
+        # numpy case (your current twotime.py)
+        C_tw_ut = np.asarray(C_tw_ut_obj)
+    C_tw = _symmetrize_upper_triangle(C_tw_ut)
+
+    # ----------------------------
+    # loaded processed TTC submatrix for the same frames
+    # ----------------------------
+    C_loaded_ut = np.asarray(run.ttc, dtype=np.float64)
+    if C_loaded_ut.ndim != 2 or C_loaded_ut.shape[0] != C_loaded_ut.shape[1]:
+        raise ValueError(f"Loaded processed TTC must be square, got {C_loaded_ut.shape}")
+
+    if int(np.max(frame_idxs)) >= C_loaded_ut.shape[0]:
+        raise ValueError(
+            f"Loaded processed TTC size {C_loaded_ut.shape[0]} is smaller than max selected frame index {int(np.max(frame_idxs))}. "
+            f"Either reduce frame_slice, or confirm the processed TTC was computed on the same frame count."
+        )
+
+    C_loaded_ut_sub = C_loaded_ut[np.ix_(frame_idxs, frame_idxs)]
+    C_loaded = _symmetrize_upper_triangle(C_loaded_ut_sub)
+
+    # ----------------------------
+    # difference
+    # ----------------------------
+    C_diff = C_tw - C_loaded
+
+    # ----------------------------
+    # clip for display (independent for main maps)
+    # ----------------------------
+    C_loaded_plot = clip_ttc(C_loaded, p_hi=float(clip_hi_percentile))
+    C_tw_plot = clip_ttc(C_tw, p_hi=float(clip_hi_percentile))
+
+    # symmetric scaling for diff
+    max_abs = float(np.nanmax(np.abs(C_diff)))
+    if not np.isfinite(max_abs) or max_abs == 0:
+        max_abs = 1.0
+
+    # ----------------------------
+    # plot
+    # ----------------------------
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    ax0, ax1, ax2 = axes
+
+    im0 = ax0.imshow(C_loaded_plot, origin="lower", cmap=cmap_main, aspect="equal", interpolation="nearest")
+    ax0.set_title(f"LOADED processed TTC\n{Path(run.results_path).name} | M{int(mask_n):03d}")
+    ax0.set_xticks([]); ax0.set_yticks([])
+
+    im1 = ax1.imshow(C_tw_plot, origin="lower", cmap=cmap_main, aspect="equal", interpolation="nearest")
+    ax1.set_title(f"twotime.py IMPORT TTC\nframes={T} pix={P} | M{int(mask_n):03d}")
+    ax1.set_xticks([]); ax1.set_yticks([])
+
+    im2 = ax2.imshow(
+        C_diff,
+        origin="lower",
+        cmap=cmap_diff,
+        aspect="equal",
+        interpolation="nearest",
+        vmin=-max_abs,
+        vmax=+max_abs,
+    )
+    ax2.set_title("DIFF (twotime_imported − loaded)")
+    ax2.set_xticks([]); ax2.set_yticks([])
+
+    fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.03, label="ΔC (a.u.)")
+    fig.tight_layout()
+    plt.show()
+
+    return {
+        "frame_idxs": frame_idxs,
+        "I_shape": (T, P),
+        "loaded_shape": tuple(C_loaded.shape),
+        "twotime_shape": tuple(C_tw.shape),
+        "diff_max_abs": max_abs,
+    }
+
+
+def exec_compare_loaded_vs_twotime_imported_ttc(
+    *,
+    base_dir: Path,
+    sample_id: str,
+    mask_n: int,
+    frame_slice: slice | None = None,
+    stride: int = 1,
+    clip_hi_percentile: float = 99.9,
+):
+    """
+    Execution wrapper for if __name__ == "__main__":.
+
+    Loads run via your existing load_run_data(), then calls
+    compare_loaded_ttc_with_twotime_imported_ttc().
+    """
+    run = load_run_data(Path(base_dir), str(sample_id), mask_n=int(mask_n))
+    try:
+        return compare_loaded_ttc_with_twotime_imported_ttc(
+            run,
+            mask_n=int(mask_n),
+            frame_slice=frame_slice,
+            stride=int(stride),
+            clip_hi_percentile=float(clip_hi_percentile),
+        )
+    finally:
+        run.close()
+
+def _gaussian_smooth(img: np.ndarray, sigma_px: float) -> np.ndarray:
+    """Try scipy gaussian filter, fall back to no smoothing if scipy not available."""
+    if sigma_px <= 0:
+        return np.asarray(img, dtype=np.float64)
+    try:
+        from scipy.ndimage import gaussian_filter  # type: ignore
+        return gaussian_filter(np.asarray(img, dtype=np.float64), sigma=float(sigma_px))
+    except Exception:
+        return np.asarray(img, dtype=np.float64)
+
+
+def _find_bright_region_center(avg_img: np.ndarray, *, smooth_sigma_px: float = 8.0) -> tuple[int, int]:
+    """
+    Find (cy, cx) using a smoothed version of avg_img so it reflects a region,
+    not a single hot pixel.
+    """
+    sm = _gaussian_smooth(avg_img, sigma_px=float(smooth_sigma_px))
+    cy, cx = np.unravel_index(np.nanargmax(sm), sm.shape)
+    return int(cy), int(cx)
+
+
+def make_bottom_half_ring_mask(
+    avg_img: np.ndarray,
+    *,
+    r_in_px: float,
+    r_out_px: float,
+    smooth_sigma_px: float = 8.0,
+    bottom_is_y_ge_center: bool = True,
+) -> np.ndarray:
+    """
+    Returns a boolean mask for the bottom half of an annulus.
+
+    bottom_is_y_ge_center=True means "bottom" is y >= cy (image origin='upper' convention).
+    """
+    if r_out_px <= r_in_px:
+        raise ValueError(f"Need r_out_px > r_in_px, got {r_in_px=} {r_out_px=}")
+
+    H, W = avg_img.shape
+    cy, cx = _find_bright_region_center(avg_img, smooth_sigma_px=float(smooth_sigma_px))
+
+    yy, xx = np.mgrid[0:H, 0:W]
+    rr = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+
+    ring = (rr >= float(r_in_px)) & (rr <= float(r_out_px))
+    if bottom_is_y_ge_center:
+        half = (yy >= cy)
+    else:
+        half = (yy <= cy)
+
+    return ring & half
+
+
+# ------------------------------------------------------------
+# Utilities: average image, extract I(t,p) for arbitrary mask
+# ------------------------------------------------------------
+
+def compute_average_image_from_raw(
+    dset_raw,
+    *,
+    start: int = 0,
+    stop: int | None = None,
+    stride: int = 1,
+) -> np.ndarray:
+    """
+    Streaming mean of raw frames so we do not load everything into RAM.
+    Assumes frames are (T, H, W) or (T, 1, H, W).
+    """
+    n_frames = int(dset_raw.shape[0])
+    if stop is None:
+        stop = n_frames
+    start = int(np.clip(start, 0, n_frames))
+    stop = int(np.clip(stop, 0, n_frames))
+    stride = int(stride)
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+    if stop <= start:
+        raise ValueError("Empty frame range")
+
+    # figure out frame shape
+    f0 = np.asarray(dset_raw[start])
+    if f0.ndim == 3 and f0.shape[0] == 1:
+        f0 = f0[0]
+    if f0.ndim != 2:
+        raise ValueError(f"Unexpected frame shape {f0.shape}")
+
+    acc = np.zeros_like(f0, dtype=np.float64)
+    count = 0
+
+    for i in range(start, stop, stride):
+        fr = np.asarray(dset_raw[i])
+        if fr.ndim == 3 and fr.shape[0] == 1:
+            fr = fr[0]
+        acc += fr.astype(np.float64, copy=False)
+        count += 1
+
+    if count == 0:
+        raise ValueError("No frames accumulated")
+    return acc / float(count)
+
+
+def extract_intensity_matrix_from_mask(
+    dset_raw,
+    roi_mask: np.ndarray,
+    *,
+    start: int = 0,
+    stop: int | None = None,
+    stride: int = 1,
+    dtype=np.float64,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build I(t,p) for an arbitrary boolean mask.
+
+    Returns:
+      I: (T, P) where P is number of pixels in mask
+      frame_idxs: (T,)
+    """
+    m = np.asarray(roi_mask).astype(bool, copy=False)
+    if m.ndim != 2:
+        raise ValueError(f"roi_mask must be 2D, got {m.shape}")
+    P = int(np.sum(m))
+    if P <= 0:
+        raise ValueError("roi_mask selects 0 pixels")
+
+    n_frames = int(dset_raw.shape[0])
+    if stop is None:
+        stop = n_frames
+    start = int(np.clip(start, 0, n_frames))
+    stop = int(np.clip(stop, 0, n_frames))
+    stride = int(stride)
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+    if stop <= start:
+        raise ValueError("Empty frame range")
+
+    frame_idxs = np.arange(start, stop, stride, dtype=int)
+    T = int(frame_idxs.size)
+
+    I = np.empty((T, P), dtype=dtype)
+    for j, fi in enumerate(frame_idxs):
+        fr = np.asarray(dset_raw[int(fi)])
+        if fr.ndim == 3 and fr.shape[0] == 1:
+            fr = fr[0]
+        I[j, :] = fr[m].astype(dtype, copy=False)
+
+    return I, frame_idxs
+
+
+# ------------------------------------------------------------
+# twotime.py TTC computation wrapper (robust to torch/numpy/generator)
+# ------------------------------------------------------------
+
+def _to_numpy(x) -> np.ndarray:
+    """Convert torch tensor / numpy / generator to numpy array."""
+    # generator -> take first (or assemble if it yields multiple)
+    if hasattr(x, "__iter__") and not isinstance(x, (np.ndarray, bytes, str)):
+        # If it's a generator from twotime, it probably yields once
+        x = next(iter(x))
+
+    # torch tensor
+    if hasattr(x, "detach") and hasattr(x, "cpu") and hasattr(x, "numpy"):
+        return x.detach().cpu().numpy()
+
+    # numpy already
+    return np.asarray(x)
+
+
+def compute_ttc_with_twotime_py(
+    I_tp: np.ndarray,
+    *,
+    do_pixel_smooth: bool = True,
+) -> np.ndarray:
+    """
+    Compute TTC using twotime.py functions, with optional per-pixel smoothing.
+
+    This assumes twotime.py exposes something equivalent to:
+      - compute_smooth_data (or similar) for per-pixel normalization
+      - calc_normal_twotime (or similar) for TTC
+
+    If the function names in your twotime.py differ, adjust them in one place below.
+    """
+    # If import fails because twotime.py is not on path, uncomment the import-by-path version.
+    import twotime as tw
+
+    # --- OPTIONAL import-by-path fallback ---
+    # import importlib.util
+    # tw_path = Path("/Users/emilioescauriza/Documents/repos/006_APS_8IDE/emilio_scripts/python_scripts/twotime.py")
+    # spec = importlib.util.spec_from_file_location("twotime", tw_path)
+    # tw = importlib.util.module_from_spec(spec)
+    # assert spec and spec.loader
+    # spec.loader.exec_module(tw)
+
+    data = np.asarray(I_tp, dtype=np.float64)
+
+    if do_pixel_smooth:
+        # twotime convention: divide each pixel column by its time-mean
+        # If your twotime.py expects transposed shapes, adapt here.
+        if hasattr(tw, "compute_smooth_data"):
+            data = _to_numpy(tw.compute_smooth_data(data))
+        elif hasattr(tw, "compute_smooth_data_single_roi"):
+            data = _to_numpy(tw.compute_smooth_data_single_roi(data))
+        else:
+            raise AttributeError("twotime.py missing compute_smooth_data (or equivalent)")
+
+    # TTC computation
+    if hasattr(tw, "calc_normal_twotime"):
+        C_ut = _to_numpy(tw.calc_normal_twotime(data))
+    elif hasattr(tw, "calc_twotime"):
+        C_ut = _to_numpy(tw.calc_twotime(data))
+    else:
+        raise AttributeError("twotime.py missing calc_normal_twotime (or equivalent)")
+
+    return np.asarray(C_ut, dtype=np.float64)
+
+
+def symmetrize_upper_triangle(C_ut: np.ndarray) -> np.ndarray:
+    C = np.asarray(C_ut, dtype=np.float64)
+    return C + C.T - np.diag(np.diag(C))
+
+
+# ------------------------------------------------------------
+# Main comparison plot: mask view (left) + TTC (right)
+# ------------------------------------------------------------
+
+def plot_mask_and_twotime_ttc(
+    run,
+    *,
+    mask_func: Callable[[np.ndarray], np.ndarray],
+    r_in_px: float,
+    r_out_px: float,
+    smooth_sigma_px: float = 8.0,
+    bottom_is_y_ge_center: bool = True,
+    frame_start: int = 0,
+    frame_stop: int | None = None,
+    frame_stride: int = 1,
+    do_pixel_smooth: bool = True,
+    clip_hi_percentile: float = 99.9,
+    cmap_img: str = "magma",
+    cmap_ttc: str = "plasma",
+    figsize: tuple[float, float] = (12.6, 5.4),
+):
+    """
+    Left: masked average image
+    Right: TTC computed by twotime.py (optionally pixel-smoothed)
+    """
+    # 1) average image from raw
+    avg = compute_average_image_from_raw(
+        run.dset_raw,
+        start=int(frame_start),
+        stop=frame_stop,
+        stride=int(frame_stride),
+    )
+
+    # 2) build custom mask from function
+    roi_mask = mask_func(
+        avg,
+        r_in_px=float(r_in_px),
+        r_out_px=float(r_out_px),
+        smooth_sigma_px=float(smooth_sigma_px),
+        bottom_is_y_ge_center=bool(bottom_is_y_ge_center),
+    )
+
+    # 3) left plot data: masked average
+    avg_masked = avg.astype(np.float64, copy=True)
+    avg_masked[~roi_mask] = np.nan
+
+    # 4) build I(t,p) from raw using this mask
+    I, frame_idxs = extract_intensity_matrix_from_mask(
+        run.dset_raw,
+        roi_mask,
+        start=int(frame_start),
+        stop=frame_stop,
+        stride=int(frame_stride),
+        dtype=np.float64,
+    )
+
+    # 5) TTC via twotime.py
+    C_ut = compute_ttc_with_twotime_py(I, do_pixel_smooth=bool(do_pixel_smooth))
+    C = symmetrize_upper_triangle(C_ut)
+
+    # clip for display
+    lo = np.nanpercentile(C, 0.0)
+    hi = np.nanpercentile(C, float(clip_hi_percentile))
+    C_plot = np.clip(C, lo, hi)
+
+    # 6) plot
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=figsize, gridspec_kw={"wspace": 0.18})
+
+    imL = axL.imshow(avg_masked, origin="upper", cmap=cmap_img, interpolation="nearest")
+    axL.set_title(f"Masked average image\nring [{r_in_px:.0f}, {r_out_px:.0f}] px, bottom-half")
+    axL.set_xticks([])
+    axL.set_yticks([])
+    fig.colorbar(imL, ax=axL, fraction=0.046, pad=0.03, label="ADU (masked)")
+
+    imR = axR.imshow(C_plot, origin="lower", cmap=cmap_ttc, interpolation="nearest", aspect="equal")
+    axR.set_title(f"twotime.py TTC\nframes {frame_idxs[0]}..{frame_idxs[-1]} step {frame_stride}")
+    axR.set_xticks([])
+    axR.set_yticks([])
+    fig.colorbar(imR, ax=axR, fraction=0.046, pad=0.03, label="C(t₁,t₂) (clipped)")
+
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "roi_mask": roi_mask,
+        "avg_image": avg,
+        "I_shape": I.shape,
+        "frame_idxs": frame_idxs,
+        "C_ut_shape": C_ut.shape,
+    }
+
+def make_bottom_half_ring_mask_centered_on_brightest_region(
+    scattering_2d: np.ndarray,
+    *,
+    r_inner_px: float,
+    r_outer_px: float,
+    bright_percentile: float = 99.7,
+    center_px: tuple[float, float] | None = None,   # NEW
+):
+    """
+    Returns:
+      roi_mask (bool 2D),
+      (cy, cx) center used (float)
+    """
+    img = np.asarray(scattering_2d, dtype=np.float64)
+    if img.ndim == 3 and img.shape[0] == 1:
+        img = img[0]
+    if img.ndim != 2:
+        raise ValueError(f"Expected scattering_2d to be 2D (or (1,H,W)), got {img.shape}")
+
+    H, W = img.shape
+
+    # -------------------------
+    # Center selection
+    # -------------------------
+    if center_px is None:
+        # EXISTING behaviour (keep your current logic here)
+        # (Whatever you already do to compute (cy, cx) from bright_percentile.)
+        thr = np.nanpercentile(img, float(bright_percentile))
+        m = np.isfinite(img) & (img >= thr)
+        if not np.any(m):
+            raise ValueError("Bright-region mask is empty, lower bright_percentile")
+
+        ys, xs = np.where(m)
+        w = img[m]
+        w = np.maximum(w, 0.0)
+        if np.all(w == 0):
+            cy = float(np.mean(ys))
+            cx = float(np.mean(xs))
+        else:
+            cy = float(np.sum(ys * w) / np.sum(w))
+            cx = float(np.sum(xs * w) / np.sum(w))
+    else:
+        cy, cx = float(center_px[0]), float(center_px[1])
+        # optional sanity clip:
+        cy = float(np.clip(cy, 0, H - 1))
+        cx = float(np.clip(cx, 0, W - 1))
+
+    # -------------------------
+    # Build bottom-half ring mask about (cy,cx)
+    # -------------------------
+    yy, xx = np.indices((H, W))
+    rr = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+
+    ring = (rr >= float(r_inner_px)) & (rr <= float(r_outer_px))
+
+    # "bottom half": define bottom as yy > cy (image coordinates)
+    bottom = (yy >= cy)
+
+    roi_mask = ring & bottom
+    return roi_mask, (cy, cx)
+
+
+def plot_custom_mask_and_twotime_ttc(
+    run: RunData,
+    *,
+    roi_mask: np.ndarray,
+    mask_title: str = "Custom mask",
+    frame_slice: slice | None = None,
+    stride: int = 1,
+    do_pixel_smooth: bool = True,
+    clip_hi_percentile: float = 99.9,
+    cmap_mask: str = "magma",
+    cmap_ttc: str = "plasma",
+    figsize: tuple[float, float] = (12.8, 5.4),
+):
+    """
+    Left: masked average image (run.scattering_2d)
+    Right: TTC computed via twotime.py TwotimeCorrelator (same logic as your working compare func)
+    """
+    import torch
+    from twotime import TwotimeCorrelator
+
+    # ----------------------------
+    # choose frames
+    # ----------------------------
+    n_frames = int(run.dset_raw.shape[0])
+    if frame_slice is None:
+        start, stop = 0, n_frames
+        step = int(stride)
+    else:
+        start = 0 if frame_slice.start is None else int(frame_slice.start)
+        stop = n_frames if frame_slice.stop is None else int(frame_slice.stop)
+        step = int(stride) if frame_slice.step is None else int(frame_slice.step)
+
+    start = int(np.clip(start, 0, n_frames))
+    stop = int(np.clip(stop, 0, n_frames))
+    if step < 1:
+        raise ValueError("stride must be >= 1")
+    if stop <= start:
+        raise ValueError(f"Invalid frame range after clipping: start={start}, stop={stop}, n_frames={n_frames}")
+
+    # ----------------------------
+    # build I(t,p) using your existing extractor
+    # ----------------------------
+    I, frame_idxs = extract_roi_intensity_matrix(
+        run.dset_raw,
+        roi_mask=np.asarray(roi_mask, dtype=bool),
+        start=start,
+        stop=stop,
+        stride=step,
+        dtype=np.float32,   # keep memory down
+    )
+    T, P = I.shape
+    if P < 2:
+        raise ValueError(f"Custom ROI has too few pixels: P={P}")
+
+    # ----------------------------
+    # twotime.py TTC (exact same pattern as your working compare function)
+    # ----------------------------
+    qinfo = {
+        "dq_idx": np.array([0], dtype=np.int32),
+        "dq_slc": [slice(0, P)],
+        "sq_idx": np.array([0], dtype=np.int32),
+        "sq_slc": [slice(0, P)],
+    }
+
+    corr = TwotimeCorrelator(
+        qinfo=qinfo,
+        frame_num=T,
+        det_size=run.scattering_2d.shape,
+        device="cpu",
+        method="normal",
+        dtype=torch.float32,
+    )
+
+    corr.process(torch.from_numpy(I))
+
+    if bool(do_pixel_smooth):
+        # divides each pixel column by its time-average (twotime's per-pixel flattening)
+        corr.compute_smooth_data()
+
+    gen = corr.calc_normal_twotime()
+    C_ut_obj = next(gen)  # first/only dq bin
+    C_ut = np.asarray(C_ut_obj)  # your current twotime.py yields numpy
+
+    C = _symmetrize_upper_triangle(C_ut)
+
+    # clip for display
+    lo = np.nanpercentile(C, 0.0)
+    hi = np.nanpercentile(C, float(clip_hi_percentile))
+    Cplot = np.clip(C, lo, hi)
+
+    # ----------------------------
+    # masked average image for display
+    # ----------------------------
+    avg = np.asarray(run.scattering_2d, dtype=np.float64)
+    avg_masked = avg.copy()
+    avg_masked[~np.asarray(roi_mask, dtype=bool)] = np.nan
+
+    a_lo = np.nanpercentile(avg, 1.0)
+    a_hi = np.nanpercentile(avg, 99.9)
+
+    # ----------------------------
+    # plot
+    # ----------------------------
+    fig, axs = plt.subplots(1, 2, figsize=figsize, gridspec_kw={"wspace": 0.22})
+
+    cmap = plt.cm.plasma.copy()
+    cmap.set_under("black")
+    cmap.set_bad("black")
+
+    pad = 20  # adjust crop margin in pixels
+
+    # avg_img should be your average image (2D)
+    # roi_mask should be your boolean ROI mask (2D, same shape)
+
+    y0, y1, x0, x1 = _bbox_from_mask(roi_mask, pad=pad)
+
+    avg_crop = avg_masked[y0:y1, x0:x1]
+    mask_crop = roi_mask[y0:y1, x0:x1]
+
+    # If you’re showing "masked average", keep outside ROI as NaN (or 0)
+    avg_crop_masked = avg_crop.astype(float, copy=True)
+    avg_crop_masked[~mask_crop] = np.nan
+
+    # avoid zeros / negatives for LogNorm
+    img = np.asarray(avg_crop_masked, dtype=np.float64)
+    img = np.where(img > 0, img, np.nan)
+
+    vmin = np.nanpercentile(img, 1.0)
+    vmax = np.nanpercentile(img, clip_hi_percentile)
+
+    im0 = axs[0].imshow(img,
+                        origin="upper",
+                        cmap="magma",
+                        norm=LogNorm(vmin=vmin, vmax=vmax),
+                        )
+    axs[0].set_title(mask_title)
+    axs[0].set_xticks([]); axs[0].set_yticks([])
+    fig.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.03)
+
+    im1 = axs[1].imshow(Cplot, origin="lower", cmap=cmap_ttc, aspect="equal", interpolation="nearest")
+    axs[1].set_title(f"twotime.py TTC | frames={T} | pixels={P} | smooth={bool(do_pixel_smooth)}")
+    axs[1].set_xticks([]); axs[1].set_yticks([])
+    fig.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.03)
+
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "frame_idxs": frame_idxs,
+        "I_shape": (int(T), int(P)),
+        "C_shape": tuple(C.shape),
+    }
+
+def _bbox_from_mask(mask: np.ndarray, pad: int = 10):
+    """
+    Return (y0, y1, x0, x1) bounding box around True pixels, with padding.
+    """
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        raise ValueError("ROI mask has zero True pixels")
+    y0 = max(int(ys.min()) - pad, 0)
+    y1 = min(int(ys.max()) + pad + 1, mask.shape[0])
+    x0 = max(int(xs.min()) - pad, 0)
+    x1 = min(int(xs.max()) + pad + 1, mask.shape[1])
+    return y0, y1, x0, x1
+
+def make_radial_mask(
+    image_shape: tuple[int, int],
+    *,
+    center_rc: tuple[float, float],
+    r_in: float = 0.0,
+    r_out: float = 50.0,
+    half: str = "bottom",   # "bottom", "top", or "full"
+    filled: bool = False,   # False -> annulus (ring), True -> filled disk
+) -> np.ndarray:
+    """
+    Returns a boolean ROI mask.
+
+    Parameters
+    ----------
+    image_shape : (H, W)
+    center_rc   : (cy, cx) in pixel coordinates (row, col)
+    r_in, r_out : inner/outer radii in pixels
+    half        : "bottom" keeps rows >= cy, "top" keeps rows <= cy, "full" keeps all
+    filled      : if True, ignore r_in (treat as 0) to make a filled disk
+
+    Notes
+    -----
+    - "bottom" vs "top" uses row index convention (increasing row goes downward).
+    """
+    H, W = image_shape
+    cy, cx = map(float, center_rc)
+
+    yy, xx = np.ogrid[:H, :W]
+    dy = yy - cy
+    dx = xx - cx
+    rr = np.sqrt(dx * dx + dy * dy)
+
+    r_out = float(r_out)
+    r_in = 0.0 if filled else float(r_in)
+
+    if r_out <= 0:
+        raise ValueError("r_out must be > 0")
+    if (not filled) and r_in < 0:
+        raise ValueError("r_in must be >= 0")
+    if (not filled) and r_in >= r_out:
+        raise ValueError("Need r_in < r_out for an annulus")
+
+    radial = (rr <= r_out) if filled else ((rr >= r_in) & (rr <= r_out))
+
+    if half == "full":
+        hemi = np.ones((H, W), dtype=bool)
+    elif half == "bottom":
+        hemi = (yy >= cy)
+    elif half == "top":
+        hemi = (yy <= cy)
+    else:
+        raise ValueError("half must be one of: 'bottom', 'top', 'full'")
+
+    return (radial & hemi).astype(bool)
+
+def exec_mask_and_twotime_ttc_custom_ring(
+    *,
+    base_dir: Path,
+    sample_id: str,
+    mask_n_for_loading: int,
+    r_inner_px: float = 10.0,
+    r_outer_px: float = 25.0,
+    bright_percentile: float = 99.7,
+    center_px: tuple[float, float] | None = None,
+    shape: str = "semi",  # "semi" or "circle"
+    fill: str = "ring",
+    frame_slice: slice | None = None,
+    stride: int = 1,
+    do_pixel_smooth: bool = True,
+    clip_hi_percentile: float = 99.9,
+):
+    """
+    Execution wrapper:
+      - uses existing load_run_data
+      - builds custom ROI mask around brightest-region centroid
+      - plots [masked avg] | [twotime TTC]
+    """
+    run = load_run_data(Path(base_dir), str(sample_id), mask_n=int(mask_n_for_loading))
+    try:
+        # --- choose centre: manual override or brightest-region centroid ---
+        img = np.asarray(run.scattering_2d, dtype=np.float64)
+
+        if center_px is None:
+            thresh = np.percentile(img, float(bright_percentile))
+            ys, xs = np.where(img >= thresh)
+            if ys.size == 0:
+                raise RuntimeError(f"No pixels above bright_percentile={bright_percentile}")
+            cy = float(np.mean(ys))
+            cx = float(np.mean(xs))
+        else:
+            cx = float(center_px[0])
+            cy = float(center_px[1])
+
+        half = "full" if shape.lower() in ("circle", "full") else "bottom"
+        filled = True if fill.lower() in ("solid", "filled", "disk") else False
+
+        # if it's solid, r_inner_px is irrelevant – but we can ignore it safely
+        roi_mask = make_radial_mask(
+            img.shape,
+            center_rc=(cy, cx),
+            r_in=0.0 if filled else float(r_inner_px),
+            r_out=float(r_outer_px),
+            half=half,  # "bottom" or "full"
+            filled=filled,  # False=ring, True=solid disk/semidisk
+        )
+
+        return plot_custom_mask_and_twotime_ttc(
+            run,
+            roi_mask=roi_mask,
+            mask_title=(
+                f"{'Bottom-half' if half == 'bottom' else 'Full'} "
+                f"{'solid' if filled else 'ring'} mask\n"
+                f"center≈({cy:.1f},{cx:.1f}), r=[{(0.0 if filled else r_inner_px):.1f},{r_outer_px:.1f}] px"
+            ),
+            frame_slice=frame_slice,
+            stride=int(stride),
+            do_pixel_smooth=bool(do_pixel_smooth),
+            clip_hi_percentile=float(clip_hi_percentile),
+        )
+
+    finally:
+        run.close()
+
 # ============================================================
 # Execution functions
 # ============================================================
 
-def data_structure_viewer():
+def _print_h5_tree(
+    f: h5py.File,
+    *,
+    max_depth: int = 6,
+    max_children_per_group: int = 200,
+    show_attrs: bool = False,
+) -> None:
+    """
+    Print an HDF5 tree: groups + datasets with shape/dtype.
+    Keeps output bounded via max_depth and max_children_per_group.
+    """
 
+    def _fmt_attrs(obj) -> str:
+        if not show_attrs:
+            return ""
+        try:
+            keys = list(obj.attrs.keys())
+        except Exception:
+            keys = []
+        if not keys:
+            return ""
+        keys = keys[:12]
+        return f"  attrs={keys}{'...' if len(keys) == 12 else ''}"
+
+    def _recurse(g: h5py.Group, prefix: str, depth: int) -> None:
+        if depth > max_depth:
+            print(prefix + "… (max_depth reached)")
+            return
+
+        try:
+            items = list(g.items())
+        except Exception as e:
+            print(prefix + f"(cannot list items: {e})")
+            return
+
+        if len(items) > max_children_per_group:
+            items = items[:max_children_per_group]
+            truncated = True
+        else:
+            truncated = False
+
+        for name, obj in items:
+            path = obj.name
+            if isinstance(obj, h5py.Dataset):
+                shape = obj.shape
+                dtype = obj.dtype
+                # show chunking/compression if present
+                chunks = obj.chunks
+                comp = obj.compression
+                extra = []
+                if chunks is not None:
+                    extra.append(f"chunks={chunks}")
+                if comp is not None:
+                    extra.append(f"compression={comp}")
+                extra_s = ("  " + ", ".join(extra)) if extra else ""
+                print(prefix + f"- {path}  [Dataset] shape={shape} dtype={dtype}{extra_s}{_fmt_attrs(obj)}")
+            elif isinstance(obj, h5py.Group):
+                print(prefix + f"+ {path}  [Group]{_fmt_attrs(obj)}")
+                _recurse(obj, prefix + "  ", depth + 1)
+            else:
+                print(prefix + f"? {path}  [{type(obj)}]{_fmt_attrs(obj)}")
+
+        if truncated:
+            print(prefix + f"… ({max_children_per_group} children shown, truncated)")
+
+    print(f"\nFILE: {getattr(f, 'filename', '<unknown>')}")
+    print("+ /  [Group]")
+    _recurse(f["/"], prefix="  ", depth=1)
+
+
+def _open_h5_safely(path: Path) -> h5py.File:
+    # hdf5plugin imported at top already, keep as-is
+    return h5py.File(Path(path), "r")
+
+
+def data_structure_viewer():
     run = load_run_data(BASE_DIR, SAMPLE_ID, mask_n=MASK_N)
 
-    print("Loaded:")
+    print("\nLoaded:")
     print("  raw:", run.raw_path)
-    print("    entry/data/data shape:", run.dset_raw.shape, "dtype:", run.dset_raw.dtype)
     print("  meta:", run.meta_path)
     print("  results:", run.results_path)
-    print("  dynamic_roi_map:", run.dynamic_roi_map.shape, run.dynamic_roi_map.dtype)
-    print("  scattering_2d:", run.scattering_2d.shape, run.scattering_2d.dtype)
-    print("  ttc:", run.ttc.shape, run.ttc.dtype)
-    print("  g2:", run.g2.shape, run.g2.dtype)
+
+    # Raw file (keep handle open via RunData)
+    _print_h5_tree(run.f_raw, max_depth=7, max_children_per_group=300, show_attrs=False)
+
+    # Meta file (keep handle open via RunData)
+    _print_h5_tree(run.f_meta, max_depth=7, max_children_per_group=300, show_attrs=False)
+
+    # Results file (open separately because RunData only keeps arrays from it)
+    f_res = _open_h5_safely(run.results_path)
+    try:
+        _print_h5_tree(f_res, max_depth=7, max_children_per_group=300, show_attrs=False)
+    finally:
+        f_res.close()
 
     run.close()
 
@@ -892,22 +2174,73 @@ def compare_existing_vs_corr_entrypoint():
     finally:
         run.close()
 
+def compare_existing_ttc_and_cgpt_ttc_from_raw():
+
+    return exec_compare_raw_vs_processed_ttc(
+        base_dir=BASE_DIR,
+        sample_id="A073",
+        mask_n=MASK_N,
+        out_path=Path("A073_M146_raw_vs_processed_vs_diff.png"),
+        clip_hi_percentile=99.9,
+    )
+
+def compare_existing_ttc_and_ttc_from_raw():
+
+    return exec_compare_loaded_vs_twotime_imported_ttc(
+        base_dir=BASE_DIR,
+        sample_id="A073",
+        mask_n=MASK_N,
+        frame_slice=slice(0, 4800),
+        stride=1,
+        clip_hi_percentile=99.9,
+    )
+
+def ttc_with_custom_mask():
+
+    return exec_mask_and_twotime_ttc_custom_ring(
+        base_dir=BASE_DIR,
+        sample_id=SAMPLE_ID,
+        mask_n_for_loading=MASK_N,      # only used to load run/scattering/results paths
+        r_inner_px=10.0,
+        r_outer_px=15.0,
+        center_px=(1198, 216),  # (cx, cy) or None to auto-detect
+        bright_percentile=99.9,
+        shape='semi',  # "semi" or "circle"
+        fill='ring',  # "ring" or "solid"
+        frame_slice=slice(0, 2000),     # IMPORTANT: start small to avoid OOM
+        stride=1,
+        do_pixel_smooth=True,
+        clip_hi_percentile=99.9,
+    )
+
+def integrated_intensities_inspector():
+
+
+
+    pass
+
 
 # ============================================================
 # User parameters / entry point
 # ============================================================
 
-BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006")
+# BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006")
+BASE_DIR = Path("/Users/emilioescauriza/Desktop")
 SAMPLE_ID = "A073"
 MASK_N = 145
-CONTROL_MASK_N = 3
+CONTROL_MASK_N = 176
 
 if __name__ == "__main__":
 
     # data_structure_viewer()
-    mask_roi_viewer()
+    # mask_roi_viewer()
     # raw_mask_oscillation_inspector()
+    # integrated_intensities_inspector()
     # comparison_of_corr_and_g_ttc_plot_methods()
     # compare_existing_vs_corr_entrypoint()
+    # compare_existing_ttc_and_cgpt_ttc_from_raw()
+    # compare_existing_ttc_and_ttc_from_raw()
+    # ttc_with_custom_mask()
+
 
     pass

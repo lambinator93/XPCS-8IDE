@@ -2281,8 +2281,6 @@ def plot_A4_17scan_central_brightest_ttcs(
 
             mask_n, _ = find_brightest_mask_by_integrated_intensity(roi_map, scat)
 
-            mask_n = mask_n + 2
-
             ttc_path = f"xpcs/twotime/correlation_map/c2_00{int(mask_n):03d}"
             if ttc_path not in f:
                 raise KeyError(f"Missing TTC path {ttc_path} in {hdf_path}")
@@ -2354,6 +2352,167 @@ def temperature_str_from_filename(hdf_path):
     name = Path(hdf_path).name
     m = re.search(r"_([0-9]{2,4}K)_", name)
     return m.group(1) if m else None
+
+def _load_ttc_for_mask(hdf_path: Path, mask_n: int) -> np.ndarray:
+    ttc_path = f"xpcs/twotime/correlation_map/c2_00{int(mask_n):03d}"
+    with h5py.File(hdf_path, "r") as f:
+        if ttc_path not in f:
+            raise KeyError(f"Missing TTC path {ttc_path} in {hdf_path}")
+        return f[ttc_path][...]
+
+
+def plot_3x5_brightest_plus_offsets_ttcs(
+    *,
+    base_dir: Path | None = None,
+    sample_ids: list[str] | tuple[str, ...] = ("A029", "A048", "A073", "A088", "A101"),
+    clip_hi_percentile: float = 99.9,
+    cmap: str = "plasma",
+    figsize: tuple[float, float] = (12.0, 7.2),
+    save: bool = True,
+    out_path: Path | None = None,
+    dpi: int = 250,
+    label_fontsize: int = 12,
+):
+    """
+    Make a 3x5 TTC figure:
+      Row 0: brightest mask
+      Row 1: brightest - 1
+      Row 2: brightest - 2
+
+    No titles, no axis labels.
+    TEMP DEBUG: each panel shows a text label with sample_id and mask number.
+
+    IMPORTANT:
+    Each TTC is normalized to its OWN color scale (per-panel vmin/vmax),
+    so visual contrast is local to each panel.
+    """
+
+    # ----------------------------
+    # Resolve base_dir at runtime (prevents NameError)
+    # ----------------------------
+    if base_dir is None:
+        if "BASE_DIR" not in globals():
+            raise ValueError(
+                "base_dir was None, and BASE_DIR is not defined in this module. "
+                "Pass base_dir=Path(...) explicitly."
+            )
+        base_dir = globals()["BASE_DIR"]
+
+    base_dir = Path(base_dir)
+
+    sample_ids = list(sample_ids)
+    if len(sample_ids) != 5:
+        raise ValueError("sample_ids must have length 5 for a 3x5 grid")
+
+    # ----------------------------
+    # EXACT brightest-mask selection as A4 function
+    # ----------------------------
+    def _brightest_mask_like_A4(hdf_path: Path) -> int:
+        with h5py.File(hdf_path, "r") as f:
+            roi_map = f["xpcs/qmap/dynamic_roi_map"][...]
+            scat = f["xpcs/temporal_mean/scattering_2d"][...]
+            if scat.ndim == 3:
+                scat = scat[0, :, :]
+        mask_n, _ = find_brightest_mask_by_integrated_intensity(roi_map, scat)
+        return int(mask_n)
+
+    # ----------------------------
+    # TTC loader (local, explicit)
+    # ----------------------------
+    def _load_ttc_for_mask(hdf_path: Path, mask_n: int) -> np.ndarray:
+        ttc_path = f"xpcs/twotime/correlation_map/c2_00{int(mask_n):03d}"
+        with h5py.File(hdf_path, "r") as f:
+            if ttc_path not in f:
+                raise KeyError(f"Missing TTC path {ttc_path} in {hdf_path}")
+            return f[ttc_path][...]
+
+    # ----------------------------
+    # Precompute brightest masks for each sample (keeps row/col logic clean)
+    # ----------------------------
+    hdf_paths: dict[str, Path] = {}
+    brightest_by_sid: dict[str, int] = {}
+
+    for sid in sample_ids:
+        hdf_path = find_results_hdf(base_dir, sid)
+        hdf_paths[sid] = hdf_path
+        brightest_by_sid[sid] = _brightest_mask_like_A4(hdf_path)
+
+    # ----------------------------
+    # Plot: 3 rows x 5 cols
+    # Row r uses offset r (0,1,2); Col c uses sample_ids[c]
+    # ----------------------------
+    fig, axes = plt.subplots(3, 5, figsize=figsize)
+    axes = np.asarray(axes)
+
+    meta: list[tuple[str, int]] = []  # (sample_id, mask_n_used), row-major (r then c)
+
+    for r, add in enumerate((0, -1, -2)):
+        for c, sid in enumerate(sample_ids):
+            ax = axes[r, c]
+
+            mask0 = brightest_by_sid[sid]
+            mask_n = int(mask0 + add)
+
+            C = _load_ttc_for_mask(hdf_paths[sid], mask_n)
+
+            # symmetrize + clip (your standard)
+            Csym = symmetrize_ttc(C)
+            Cplot = clip_ttc(Csym, p_hi=float(clip_hi_percentile))
+
+            # per-panel normalization (after clipping)
+            vmin = float(np.nanmin(Cplot))
+            vmax = float(np.nanmax(Cplot))
+            if not (np.isfinite(vmin) and np.isfinite(vmax)) or vmax <= vmin:
+                vmin, vmax = None, None
+
+            ax.imshow(
+                Cplot,
+                origin="lower",
+                cmap=cmap,
+                interpolation="nearest",
+                aspect="equal",
+                vmin=vmin,
+                vmax=vmax,
+            )
+
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_frame_on(False)
+
+            # TEMP label (remove later)
+            ax.text(
+                0.02, 0.98,
+                f"{sid} | M{mask_n:03d}",
+                transform=ax.transAxes,
+                ha="left", va="top",
+                fontsize=label_fontsize,
+                color="white",
+                bbox=dict(
+                    boxstyle="round,pad=0.25",
+                    facecolor="black",
+                    alpha=0.6,
+                    edgecolor="none",
+                ),
+            )
+
+            meta.append((sid, mask_n))
+
+    plt.tight_layout(pad=0.5)
+
+    # ----------------------------
+    # Save + show
+    # ----------------------------
+    if save:
+        if out_path is None:
+            out_path = Path.cwd() / "ttc_3x5_brightest_plus_0_1_2.png"
+        else:
+            out_path = Path(out_path)
+
+        fig.savefig(out_path, dpi=int(dpi), bbox_inches="tight")
+        print(f"Saved: {out_path}")
+
+    plt.show()
+    return meta
 
 
 # ============================================================
@@ -2508,6 +2667,18 @@ def plot_A4_17scan_central_brightest_ttcs_entrypoint():
         textbox_fontsize=8,
     )
 
+def exec_plot_3x5_brightest_plus_offsets_ttcs():
+
+    return plot_3x5_brightest_plus_offsets_ttcs(
+        base_dir=BASE_DIR,
+        sample_ids=["A029", "A048", "A073", "A088", "A101"],
+        clip_hi_percentile=99.9,
+        cmap="plasma",
+        figsize=(12.0, 7.2),
+        save=True,
+        out_path=Path("A4_3x5_brightest_plus012.png"),
+    )
+
 
 BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
 SAMPLE_ID = "A073"
@@ -2520,9 +2691,10 @@ if __name__ == "__main__":
     # plot_of_period_vs_diagonal_start()
     # plot_of_single_fft_antidiagonal_lineout()
     # plot_of_period_vs_diagonal_start_both_lineouts()
-    # fft_2d_plot()
+    fft_2d_plot()
     # fft_2d_fitting_and_parameter_extraction()
-    plot_A4_17scan_central_brightest_ttcs_entrypoint()
+    # plot_A4_17scan_central_brightest_ttcs_entrypoint()
+    # exec_plot_3x5_brightest_plus_offsets_ttcs()
 
 
     pass

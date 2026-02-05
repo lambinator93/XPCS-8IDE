@@ -1202,10 +1202,11 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
+# BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
+BASE_DIR = Path("/Users/emilioescauriza/Desktop/Twotime_PostExpt_01")
 POSITION_NAME = "A5"
-SAMPLE_ID = "A017"
-MASK_N = 26
+SAMPLE_ID = "A073"
+MASK_N = 146
 
 # Which plots to generate in process_position (None = all 6)
 GENERATE_KEYS = None # {"twotime_9", "twotime_25"}  # None or for example: {"overview_25", "twotime_25"} to only generate these two
@@ -1216,7 +1217,7 @@ UPLOAD_KEYS = None  # or example: {"overview_25"} to upload only overview_25 onl
 if __name__ == "__main__":
 
     # exec_google_sheet_upload()
-    # exec_single_mask_plot_save()
-    exec_q_dependent_ttc_plot()
+    exec_single_mask_plot_save()
+    # exec_q_dependent_ttc_plot()
 
     pass

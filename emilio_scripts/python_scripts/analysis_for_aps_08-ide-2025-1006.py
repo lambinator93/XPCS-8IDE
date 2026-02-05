@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from networkx.algorithms.operators.binary import difference
 
+from emilio_scripts.python_scripts.raw_data_inspection import integrated_intensities_inspector
 # from erik_file_transfer.notebooks.xpcs_1 import intensity
 from source_functions import *
 from xpcs import *
@@ -140,8 +141,19 @@ def static_vs_dynamic_bins(filename):
     plt.figure()
     plt.imshow(individual_mask)
 
-    plt.figure()
-    plt.imshow(np.log(scattering_2d_reshape)+1e-5)
+    cmap = plt.cm.plasma.copy()
+    cmap.set_under("black")
+    cmap.set_bad("black")
+
+    I = scattering_2d_reshape.astype(float)
+
+    plt.imshow(I,
+        origin="upper",
+        cmap=cmap,
+        norm=LogNorm(vmin=0.1, vmax=np.max(I)),
+        interpolation="nearest",
+    )
+    # ax0.set_facecolor("black")
 
     # np.savetxt('dynamic_roi_map.txt', dynamic_roi_map)
     # print(np.shape(dynamic_roi_map))
@@ -415,12 +427,327 @@ def q_spacing_inspector(filename):
     for j in range(29):
         print(phi[j + 1] - phi[j])
 
+def integrated_intensities_inspector(filename):
+
+    with h5py.File(filename, "r") as f:
+        # dynamic_roi_map = f["xpcs/qmap/dynamic_roi_map"][...]
+        # scattering_2d = f["xpcs/temporal_mean/scattering_2d"][...]
+        # ttc = f["xpcs/twotime/correlation_map/c2_00194"][...]
+        # g2 = f["xpcs/twotime/normalized_g2"][...]
+        # q = f["xpcs/qmap/dynamic_v_list_dim0"][...]
+        # phi = f["xpcs/qmap/dynamic_v_list_dim1"][...]
+        integrated_intensities = f["xpcs/temporal_mean/scattering_1d"][...]
+        integrated_intensities_segments = f["xpcs/temporal_mean/scattering_1d_segments"][...]
+        q = f["xpcs/qmap/static_v_list_dim0"][...]
+        phi = f["xpcs/qmap/static_v_list_dim1"][...]
+
+
+        print(np.shape(integrated_intensities))
+        print(np.shape(integrated_intensities_segments))
+        print(integrated_intensities)
+
+        np.savetxt("integrated_intensities.txt", integrated_intensities)
+        np.savetxt("integrated_intensities_segments.txt", integrated_intensities_segments)
+
+        print("q:", np.shape(q), q)
+        print("phi:", np.shape(phi), phi)
+
+        plt.figure()
+        plt.plot(integrated_intensities[0])
+
+        plt.figure()
+        plt.plot(integrated_intensities_segments[0])
+        plt.plot(integrated_intensities_segments[1])
+        plt.plot(integrated_intensities_segments[2])
+
+
+        # plt.ylim([0, 1])
+        plt.show()
+
+def integrated_intensities_plot(h5_file: str | Path):
+    """
+    Plots scattering_1d (mean) and scattering_1d_segments (10 time segments).
+
+    Assumes flattening order where phi is the fast axis:
+        flat index = iq * nphi + iphi
+    so that reshape -> (nq, nphi).
+    """
+    h5_file = str(h5_file)
+
+    import numpy as np
+    import h5py
+    import matplotlib.pyplot as plt
+
+    with h5py.File(h5_file, "r") as f:
+        I1d = f["xpcs/temporal_mean/scattering_1d"][...]
+        Iseg = f["xpcs/temporal_mean/scattering_1d_segments"][...]
+        q = f["xpcs/qmap/static_v_list_dim0"][...]
+        phi = f["xpcs/qmap/static_v_list_dim1"][...]
+
+    # ---- basic sanity ----
+    I1d = np.asarray(I1d)
+    Iseg = np.asarray(Iseg)
+    q = np.asarray(q)
+    phi = np.asarray(phi)
+
+    if I1d.ndim != 2 or I1d.shape[0] != 1:
+        raise ValueError(f"Expected scattering_1d shape (1, 3600), got {I1d.shape}")
+    if Iseg.ndim != 2 or Iseg.shape[1] != I1d.shape[1]:
+        raise ValueError(f"Expected scattering_1d_segments shape (10, 3600), got {Iseg.shape}")
+
+    nq = int(q.size)
+    nphi = int(phi.size)
+    if nq * nphi != int(I1d.shape[1]):
+        raise ValueError(
+            f"q.size * phi.size = {nq}*{nphi}={nq*nphi} does not match scattering_1d length {I1d.shape[1]}"
+        )
+
+    # ---- reshape to (q, phi) ----
+    I_mean_qphi = I1d[0].reshape(nq, nphi)
+    I_seg_qphi = Iseg.reshape(Iseg.shape[0], nq, nphi)  # (nseg, nq, nphi)
+
+    # Choose a representative phi index: closest to 0 degrees
+    iphi0 = int(np.argmin(np.abs(phi - 0.0)))
+
+    # ---- derived summaries ----
+    # phi-averaged intensity vs q for each segment
+    Iseg_q = I_seg_qphi.mean(axis=2)          # (nseg, nq)
+    Imean_q = I_mean_qphi.mean(axis=1)        # (nq,)
+
+    # variability over time segments at each (q,phi)
+    I_std_qphi = I_seg_qphi.std(axis=0)       # (nq, nphi)
+    I_relstd_qphi = I_std_qphi / np.maximum(I_mean_qphi, 1e-12)
+
+    # ---- plotting ----
+    fig = plt.figure(figsize=(14.5, 9.5))
+    gs = fig.add_gridspec(2, 2, wspace=0.28, hspace=0.28)
+
+    # (A) Mean map in (q, phi)
+    ax0 = fig.add_subplot(gs[0, 0])
+    im0 = ax0.imshow(
+        I_mean_qphi,
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        extent=[phi.min(), phi.max(), q.min(), q.max()],
+    )
+    ax0.set_title("Mean scattering_1d reshaped to (q, φ)")
+    ax0.set_xlabel("φ (deg)")
+    ax0.set_ylabel("q (Å$^{-1}$)")
+    fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.03, label="Intensity (a.u.)")
+
+    # (B) Segment evolution as (segment index, q) for φ≈0 slice
+    ax1 = fig.add_subplot(gs[0, 1])
+    seg_vs_q_phi0 = I_seg_qphi[:, :, iphi0]  # (nseg, nq)
+    im1 = ax1.imshow(
+        seg_vs_q_phi0,
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        extent=[q.min(), q.max(), 0, seg_vs_q_phi0.shape[0] - 1],
+    )
+    ax1.set_title(f"Segments vs q at φ≈{phi[iphi0]:.3f}° (closest to 0°)")
+    ax1.set_xlabel("q (Å$^{-1}$)")
+    ax1.set_ylabel("segment index")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.03, label="Intensity (a.u.)")
+
+    # (C) Line plot: φ-averaged intensity vs q for each segment + mean
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.plot(q, Imean_q, lw=2.5, label="mean (φ-avg)")
+    for s in range(Iseg_q.shape[0]):
+        ax2.plot(q, Iseg_q[s], lw=1.2, alpha=0.8, label=f"seg {s}" if s < 4 else None)
+    ax2.set_title("φ-averaged intensity vs q (all segments)")
+    ax2.set_xlabel("q (Å$^{-1}$)")
+    ax2.set_ylabel("Intensity (a.u.)")
+    ax2.grid(True, alpha=0.25)
+    ax2.legend(loc="best", fontsize=9)
+
+    # (D) Relative variability map (std/mean) in (q, phi)
+    ax3 = fig.add_subplot(gs[1, 1])
+    im3 = ax3.imshow(
+        I_relstd_qphi,
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        extent=[phi.min(), phi.max(), q.min(), q.max()],
+    )
+    ax3.set_title("Temporal variability: std(seg)/mean  (q, φ)")
+    ax3.set_xlabel("φ (deg)")
+    ax3.set_ylabel("q (Å$^{-1}$)")
+    fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.03, label="Relative std")
+
+    fig.suptitle(f"Integrated intensity diagnostics\n{h5_file}", y=0.98, fontsize=12)
+    plt.show()
+
+
+def find_bragg_peak_center_from_scattering_2d_with_overlay_function(
+    h5_file: str | Path,
+    *,
+    dataset_key: str = "xpcs/temporal_mean/scattering_2d",
+    use_first_frame_if_3d: bool = True,
+    smooth_sigma_px: float | None = 1.0,
+    bright_percentile: float = 99.7,
+    weight_mode: str = "log",  # "linear" | "sqrt" | "log"
+    figsize: tuple[float, float] = (7.2, 6.4),
+) -> tuple[tuple[float, float], dict]:
+    """
+    Option 1 (robust bright-region centroid) + ALWAYS makes an overlay plot.
+
+    Steps
+    -----
+    1) Load scattering_2d (use first frame if it's (1,H,W))
+    2) Light smoothing (optional)
+    3) Threshold at bright_percentile to define a "bright region"
+    4) Compute weighted centroid of that region
+    5) Plot: scattering_2d with mask outline + centroid marker
+
+    Returns
+    -------
+    (cy, cx) : (float, float)
+        Estimated centre (row, col) in pixel coordinates.
+    info : dict
+        Debug info: threshold, n_pixels_used, etc.
+    """
+    h5_file = Path(h5_file)
+
+    with h5py.File(h5_file, "r") as f:
+        scat = f[dataset_key][...]
+
+    scat = np.asarray(scat)
+    if scat.ndim == 3 and use_first_frame_if_3d:
+        scat = scat[0, :, :]
+    if scat.ndim != 2:
+        raise ValueError(f"{dataset_key} must be 2D (or 3D with first-frame), got {scat.shape}")
+
+    img = scat.astype(np.float64, copy=False)
+
+    # Optional smoothing (very light) to stabilize centroid under hot pixels
+    if smooth_sigma_px is not None and smooth_sigma_px > 0:
+        try:
+            from scipy.ndimage import gaussian_filter
+            img_s = gaussian_filter(img, sigma=float(smooth_sigma_px))
+        except Exception:
+            img_s = img
+    else:
+        img_s = img
+
+    # Bright-region mask
+    p = float(np.clip(bright_percentile, 0.0, 100.0))
+    thr = float(np.nanpercentile(img_s, p))
+    mask = np.isfinite(img_s) & (img_s >= thr)
+    n = int(mask.sum())
+
+    # If too few pixels, relax threshold slightly
+    if n < 10:
+        p2 = max(90.0, p - 5.0)
+        thr = float(np.nanpercentile(img_s, p2))
+        mask = np.isfinite(img_s) & (img_s >= thr)
+        n = int(mask.sum())
+
+    if n < 10:
+        raise ValueError(
+            f"Bright-region mask too small (n={n}). "
+            f"Lower bright_percentile (currently {bright_percentile})."
+        )
+
+    yy, xx = np.nonzero(mask)
+    vals = img_s[yy, xx]
+
+    # Weights (to reduce dominance of extreme skew / hot pixels)
+    if weight_mode == "linear":
+        w = np.clip(vals, 0.0, np.inf)
+    elif weight_mode == "sqrt":
+        w = np.sqrt(np.clip(vals, 0.0, np.inf))
+    elif weight_mode == "log":
+        w = np.log1p(np.clip(vals, 0.0, np.inf))
+    else:
+        raise ValueError("weight_mode must be one of: 'linear', 'sqrt', 'log'")
+
+    wsum = float(np.sum(w))
+    if not np.isfinite(wsum) or wsum <= 0:
+        raise ValueError("Non-positive or non-finite weight sum, cannot compute centroid")
+
+    cy = float(np.sum(yy * w) / wsum)
+    cx = float(np.sum(xx * w) / wsum)
+
+    info = {
+        "h5_file": str(h5_file),
+        "dataset_key": dataset_key,
+        "img_shape": tuple(img.shape),
+        "smooth_sigma_px": smooth_sigma_px,
+        "bright_percentile": float(bright_percentile),
+        "threshold_value": float(thr),
+        "n_pixels_used": n,
+        "weight_mode": weight_mode,
+        "centroid_cy_cx": (cy, cx),
+    }
+
+    # -------------------------
+    # Overlay plot (always)
+    # -------------------------
+    # Use log1p for display to handle heavy skew safely (works with zeros)
+    disp = np.log1p(np.clip(img, 0.0, np.inf))
+
+    # Robust display limits
+    vmin = float(np.nanpercentile(disp, 1.0))
+    vmax = float(np.nanpercentile(disp, 99.8))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        vmin, vmax = None, None
+
+    img = np.asarray(disp, dtype=np.float64)
+    img = np.where(img > 0, img, np.nan)
+
+    vmin = np.nanpercentile(img, 1.0)
+    vmax = np.nanpercentile(img, 99.999)
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    im = ax.imshow(
+        img,
+        origin="upper",
+        cmap="magma",
+        norm=LogNorm(vmin=vmin, vmax=vmax),
+    )
+
+    # Mask outline
+    ax.contour(mask.astype(np.float32), levels=[0.5], linewidths=1.2, colors="cyan")
+
+    # Centroid marker
+    ax.plot(cx, cy, marker="x", markersize=10, mew=2.2)
+
+    ax.set_title(
+        f"Bragg peak centre (bright-region centroid)\n"
+        f"p={bright_percentile:.2f}, n={n}, weight={weight_mode}, σ={smooth_sigma_px}"
+    )
+    ax.set_xlabel("x (pixel)")
+    ax.set_ylabel("y (pixel)")
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+    cb.set_label("log1p(scattering_2d)")
+
+    plt.tight_layout()
+    plt.show()
+
+    return (cy, cx), info
+
+def execute_find_bragg_peak_center_from_scattering_2d_with_overlay():
+
+    (cy, cx), info = find_bragg_peak_center_from_scattering_2d_with_overlay_function(
+        filename,
+        bright_percentile=99.7,
+        smooth_sigma_px=1.0,
+        weight_mode="log",
+    )
+
+    print(f"Bragg peak centre: cy={cy:.2f}, cx={cx:.2f}")
+    print(info)
+
 
 
 file_ID = 'A073'
 
 if file_ID == 'A013':
     filename = (r'/Users/emilioescauriza/Desktop/A013_IPA_NBH_1_att0100_079K_001_results.hdf')
+elif file_ID == 'A073':
+    filename = (r'/Users/emilioescauriza/Desktop/Twotime_PostExpt_01/A073_IPA_NBH_1_att0100_260K_001_results.hdf')
 else:
     base = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
     filename = next(base.glob(f"{file_ID}_*_results.hdf"))
@@ -438,7 +765,9 @@ if __name__ == "__main__":
     # oauth_test()
     # image_upload()
     # figure_upload()
-    q_spacing_inspector(h5_file)
-
+    # q_spacing_inspector(h5_file)
+    # integrated_intensities_inspector(h5_file)
+    # integrated_intensities_plot(h5_file)
+    execute_find_bragg_peak_center_from_scattering_2d_with_overlay()
 
     pass
