@@ -17,7 +17,12 @@ class XPCSConfig:
     scan: int
 
 
-def load_xpcs_config(config_name: str, scan: int, config_dir: Path = Path('../configs')) -> XPCSConfig:
+def load_xpcs_config(
+    config_name: str,
+    scan: int,
+    config_dir: Path = Path('../configs'),
+    base_dir_override: Path | None = None,
+) -> XPCSConfig:
     """
     Load XPCS configuration and extract parameters for a given scan.
     
@@ -25,6 +30,8 @@ def load_xpcs_config(config_name: str, scan: int, config_dir: Path = Path('../co
         config_name: Name of the JSON config file (e.g., "config_IPA_NBH_A4.json")
         scan: Scan number to load
         config_dir: Path to configs directory
+        base_dir_override: If set, use this as the data base directory instead of config["Base"]
+                          (so you can point to local data when the config path is not available).
     
     Returns:
         XPCSConfig with all extracted parameters
@@ -34,7 +41,7 @@ def load_xpcs_config(config_name: str, scan: int, config_dir: Path = Path('../co
     with open(config_file, "r") as f:
         config = json.load(f)
     
-    base_dir = Path(config["Base"])
+    base_dir = base_dir_override if base_dir_override is not None else Path(config["Base"])
     dataset_path = Path(config[str(scan)])
     work_path = base_dir / dataset_path
     

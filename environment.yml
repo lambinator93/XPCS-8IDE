@@ -34,4 +34,5 @@ dependencies:
   - ipympl
   - cmcrameri
   - scikit-beam
+  - argcomplete
 prefix: /Users/eriklamb/miniforge3/envs/xpcs
