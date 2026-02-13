@@ -26,6 +26,7 @@
 # Imports
 # ============================================================
 
+import re
 import time
 import random
 from dataclasses import dataclass
@@ -1088,6 +1089,101 @@ def plot_single_mask_scan(
 
 
 # ============================================================
+# Bragg peak center (argmax) + T from filename for t_dep_xrd
+# ============================================================
+
+def temperature_k_from_filename(hdf_path: Path) -> Optional[int]:
+    """
+    Extract temperature in Kelvin from results HDF filename (e.g. ..._260K_... → 260).
+    """
+    match = re.search(r"(\d+)K", hdf_path.name)
+    return int(match.group(1)) if match else None
+
+
+def bragg_peak_center_argmax(hdf_path: Path, *, phi_fast_axis: bool = True) -> tuple[float, float]:
+    """
+    Find Bragg peak (q0, phi0) from temporal-mean scattering_1d using argmax,
+    same method as integrated_intensities_plot() in analysis_for_aps_08-ide-2025-1006.py.
+    Returns (q0, phi0_deg).
+    """
+    with h5py.File(hdf_path, "r") as f:
+        I1d = np.asarray(f["xpcs/temporal_mean/scattering_1d"][...])
+        q = _as_1d(f["xpcs/qmap/static_v_list_dim0"][...])
+        phi = _as_1d(f["xpcs/qmap/static_v_list_dim1"][...])
+    nq, nphi = int(q.size), int(phi.size)
+    if I1d.ndim != 2 or I1d.shape[0] != 1 or nq * nphi != int(I1d.shape[1]):
+        raise ValueError(
+            f"scattering_1d shape {I1d.shape} does not match q.size={nq} * phi.size={nphi}"
+        )
+    if phi_fast_axis:
+        I_mean_qphi = I1d[0].reshape(nq, nphi)
+    else:
+        I_mean_phiq = I1d[0].reshape(nphi, nq)
+        I_mean_qphi = np.transpose(I_mean_phiq, (1, 0))
+    iq0, iphi0 = np.unravel_index(int(np.nanargmax(I_mean_qphi)), I_mean_qphi.shape)
+    q0 = float(q[iq0])
+    phi0 = float(phi[iphi0])
+    return q0, phi0
+
+
+def bragg_peak_center_argmax_second_moment_uncertainty(
+    hdf_path: Path,
+    *,
+    phi_fast_axis: bool = True,
+    eps: float = 1e-12,
+) -> tuple[float, float, float, float]:
+    """
+    Bragg peak (q0, phi0) from argmax; uncertainties from intensity-weighted second moments
+    on the mean (q, φ) map. Center = argmax; σ_q, σ_φ = sqrt(weighted variance) with w = I.
+    Returns (q0, phi0, sigma_q, sigma_phi).
+    """
+    with h5py.File(hdf_path, "r") as f:
+        I1d = np.asarray(f["xpcs/temporal_mean/scattering_1d"][...])
+        q = _as_1d(f["xpcs/qmap/static_v_list_dim0"][...])
+        phi = _as_1d(f["xpcs/qmap/static_v_list_dim1"][...])
+    nq, nphi = int(q.size), int(phi.size)
+    if I1d.ndim != 2 or I1d.shape[0] != 1 or nq * nphi != int(I1d.shape[1]):
+        raise ValueError(
+            f"scattering_1d shape {I1d.shape} does not match q.size={nq} * phi.size={nphi}"
+        )
+    if phi_fast_axis:
+        I_mean_qphi = I1d[0].reshape(nq, nphi)
+    else:
+        I_mean_phiq = I1d[0].reshape(nphi, nq)
+        I_mean_qphi = np.transpose(I_mean_phiq, (1, 0))
+
+    iq0, iphi0 = np.unravel_index(int(np.nanargmax(I_mean_qphi)), I_mean_qphi.shape)
+    q0 = float(q[iq0])
+    phi0 = float(phi[iphi0])
+
+    w = np.clip(np.asarray(I_mean_qphi, dtype=np.float64), 0.0, None)
+    sw = float(np.sum(w))
+    if not np.isfinite(sw) or sw <= eps:
+        uq = np.sort(np.unique(np.asarray(q, dtype=np.float64)))
+        uphi = np.sort(np.unique(np.asarray(phi, dtype=np.float64)))
+        dq = float(np.min(np.diff(uq))) / 2.0 if uq.size >= 2 else 1e-5
+        dphi = float(np.min(np.diff(uphi))) / 2.0 if uphi.size >= 2 else 0.5
+        return q0, phi0, dq, dphi
+
+    q_2d = np.asarray(q, dtype=np.float64)[:, np.newaxis]  # (nq, nphi)
+    phi_2d = np.asarray(phi, dtype=np.float64)[np.newaxis, :]  # (nq, nphi)
+    q_bar = float(np.sum(w * q_2d) / sw)
+    phi_bar = float(np.sum(w * phi_2d) / sw)
+    var_q = float(np.sum(w * (q_2d - q_bar) ** 2) / sw)
+    var_phi = float(np.sum(w * (phi_2d - phi_bar) ** 2) / sw)
+    sigma_q = np.sqrt(max(var_q, 0.0))
+    sigma_phi = np.sqrt(max(var_phi, 0.0))
+
+    uq = np.sort(np.unique(np.asarray(q, dtype=np.float64)))
+    uphi = np.sort(np.unique(np.asarray(phi, dtype=np.float64)))
+    dq_half = float(np.min(np.diff(uq))) / 2.0 if uq.size >= 2 else 1e-5
+    dphi_half = float(np.min(np.diff(uphi))) / 2.0 if uphi.size >= 2 else 0.5
+    sigma_q = max(sigma_q, dq_half)
+    sigma_phi = max(sigma_phi, dphi_half)
+    return q0, phi0, sigma_q, sigma_phi
+
+
+# ============================================================
 # Execution functions
 # ============================================================
 
@@ -1153,6 +1249,102 @@ def exec_q_dependent_ttc_plot():
     print("Saved:", out_path)
 
 
+def t_dep_xrd_argmax(
+    *,
+    position_name: str | None = None,
+    base_dir: Path | None = None,
+    out_dir: Path | None = None,
+) -> None:
+    """
+    For all samples at a position: find Bragg peak (q0, phi0) via argmax on scattering_1d,
+    uncertainties from intensity-weighted second moments (σ_q, σ_φ), get temperature
+    from the results HDF filename, then plot q0 and phi0 vs T with error bars.
+    Uses module CONFIG (POSITION_NAME, BASE_DIR, OUT_DIR) when arguments are None.
+    """
+    base_dir = base_dir or BASE_DIR
+    position_name = position_name or POSITION_NAME
+    out_dir = out_dir or OUT_DIR
+
+    creds = get_creds(TOKEN_PATH, CREDS_PATH, SCOPES)
+    ws, _ = get_ws_and_drive(creds, SPREADSHEET_ID, TAB_NAME)
+    rows_and_ids = get_ids_for_position(ws, position_name)
+    if not rows_and_ids:
+        print(f"No sample IDs found for position {position_name}")
+        return
+
+    T_list: list[int] = []
+    q0_list: list[float] = []
+    phi0_list: list[float] = []
+    q0_err_list: list[float] = []
+    phi0_err_list: list[float] = []
+    sample_ids_used: list[str] = []
+
+    for _row, sample_id in rows_and_ids:
+        hdf_path = find_results_hdf(base_dir, sample_id)
+        if hdf_path is None:
+            print(f"SKIP: no HDF for {sample_id}")
+            continue
+        T = temperature_k_from_filename(hdf_path)
+        if T is None:
+            print(f"SKIP: no temperature in filename for {sample_id} ({hdf_path.name})")
+            continue
+        try:
+            q0, phi0, q0_err, phi0_err = bragg_peak_center_argmax_second_moment_uncertainty(hdf_path)
+        except Exception as e:
+            print(f"SKIP: {sample_id} bragg_peak_center_argmax_second_moment_uncertainty failed: {e}")
+            continue
+        T_list.append(T)
+        q0_list.append(q0)
+        phi0_list.append(phi0)
+        q0_err_list.append(q0_err)
+        phi0_err_list.append(phi0_err)
+        sample_ids_used.append(sample_id)
+
+    if not T_list:
+        print("No data to plot.")
+        return
+
+    # sort by T for clean curve
+    order = np.argsort(T_list)
+    T_arr = np.array(T_list)[order]
+    q0_arr = np.array(q0_list)[order]
+    phi0_arr = np.array(phi0_list)[order]
+    q0_err_arr = np.array(q0_err_list)[order]
+    phi0_err_arr = np.array(phi0_err_list)[order]
+
+    plt.rcParams.update({
+        'font.size': 14,
+        'axes.titlesize': 14,
+        'axes.labelsize': 14,
+        'xtick.labelsize': 14,
+        'ytick.labelsize': 14,
+    })
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+    ax1.errorbar(T_arr[0:-1], q0_arr[0:-1], yerr=q0_err_arr[0:-1], fmt="o-", color="C0", capsize=3)
+    ax1.set_ylabel("q₀ (Å⁻¹)")
+    ax1.set_xlabel("T (K)")
+    ax1.set_title("Bragg peak q vs temperature")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.errorbar(T_arr[0:-1], phi0_arr[0:-1], yerr=phi0_err_arr[0:-1], fmt="s-", color="C1", capsize=3)
+    ax2.set_ylabel("φ₀ (deg)")
+    ax2.set_xlabel("T (K)")
+    ax2.set_title("Bragg peak φ vs temperature")
+    ax2.grid(True, alpha=0.3)
+
+    fig.suptitle(f"Position {position_name}", y=0.98)
+    fig.tight_layout()
+
+    out_base = out_dir / "t_dep_xrd"
+    out_base.mkdir(parents=True, exist_ok=True)
+    out_path = out_base / f"bragg_vs_T_{position_name}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print("Saved:", out_path)
+
+    plt.show()
+
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -1202,9 +1394,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
-BASE_DIR = Path("/Users/emilioescauriza/Desktop/Twotime_PostExpt_01")
-POSITION_NAME = "A5"
+BASE_DIR = Path("/Volumes/EmilioSD4TB/APS_08-IDEI-2025-1006/Twotime_PostExpt_01")
+# BASE_DIR = Path("/Users/emilioescauriza/Desktop/Twotime_PostExpt_01")
+POSITION_NAME = "A4"
 SAMPLE_ID = "A073"
 MASK_N = 146
 
@@ -1217,7 +1409,9 @@ UPLOAD_KEYS = None  # or example: {"overview_25"} to upload only overview_25 onl
 if __name__ == "__main__":
 
     # exec_google_sheet_upload()
-    exec_single_mask_plot_save()
+    # exec_single_mask_plot_save()
     # exec_q_dependent_ttc_plot()
+    t_dep_xrd_argmax()
+    # all_bragg_peaks_centre_plot()
 
     pass

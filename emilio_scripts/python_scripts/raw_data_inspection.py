@@ -242,36 +242,207 @@ def _apply_mask_and_clip(frame2d, roi_mask, clip_percentile: float):
 
 
 def launch_masked_raw_viewer(
-    run,
+    run: RunData,
     *,
-    mask_n: int,
+    mask_n: int | str,
     start_frame: int = 0,
     clip_percentile_init: float = 99.9,
     cmap: str = "magma",
+    use_log: bool = True,
+    log_eps: float = 1e-3,
+    fixed_log_vmax: float | None = 4.0,   # set None to auto (fast, from start frame)
+    fixed_log_vmin: float | None = None,  # set None to auto (fast, from start frame)
+
+    # --- MP4 export ---
+    mp4_export: bool = False,
+    export_path: str = "../figures_export/movies/masked_movie.mp4",
+    export_start_frame: int | None = None,
+    export_n_frames: int | None = None,
+    frame_skip: int = 1,
+    fps: int = 30,
+
+    # --- crop ---
+    crop_size: int = 300,
+
+    # If fixed_log_vmax is None and you REALLY want global scaling, set True.
+    # This is slow because it scans many frames.
+    scan_global_vmax: bool = False,
+    scan_block: int = 64,
 ):
-    """
-    Interactive viewer:
+    """Interactive masked viewer + optional MP4 export.
+
+    Viewer controls:
       - Left/right arrow keys: previous/next frame
       - Slider: clip percentile (suppresses hot pixels within ROI)
-      - Shows ONLY the ROI pixels (outside ROI is NaN)
 
-    Requires:
-      run.dset_raw           (HDF5 dataset: frames, ny, nx)
-      run.dynamic_roi_map    (2D label map)
+    Data requirements:
+      - run.dset_raw        : HDF5 dataset (frames, ny, nx) or (frames, 1, ny, nx)
+      - run.dynamic_roi_map : 2D label image
+
+    mask_n:
+      - int  : use ROI label mask_n
+      - "peak": crop a square (crop_size x crop_size) around the brightest REGION in start_frame
+
+    MP4 export:
+      - If mp4_export=True, writes an mp4 using the SAME rendering as displayed.
+      - Uses fixed color scaling (vmin/vmax constant across frames) so pulsing is visible.
+      - frame_skip exports every Nth frame (1 = all frames).
+
+    Notes
+    -----
+    - By default, fixed_log_vmax=4.0 keeps log scaling visually stable and fast.
+    - If fixed_log_vmax=None and scan_global_vmax=True, we scan the export frame range
+      to set vmax. This can be slow.
     """
-    dset = run.dset_raw
-    n_frames = int(dset.shape[0])
 
-    roi_mask, used_label = _make_roi_boolean_mask(run.dynamic_roi_map, mask_n)
+    # ----------------------------
+    # Small helpers
+    # ----------------------------
+    def _read_frame2d(frame_idx: int) -> np.ndarray:
+        """Read one frame as 2D float64 without loading the whole stack."""
+        fr = np.asarray(run.dset_raw[int(frame_idx)])
+        if fr.ndim == 3 and fr.shape[0] == 1:
+            fr = fr[0]
+        if fr.ndim != 2:
+            raise ValueError(f"Unexpected raw frame shape {fr.shape} at index {frame_idx}")
+        return fr.astype(np.float64, copy=False)
 
-    # --- find ROI centre once ---
-    cy, cx = roi_center_from_label_map(run.dynamic_roi_map, mask_n)
+    def _find_bright_region_center_in_frame(frame2d: np.ndarray) -> tuple[int, int]:
+        """Return (cy,cx) for a bright region (robust vs single hot pixel)."""
+        f = np.clip(frame2d, 0.0, None)
+        pos = f[f > 0]
+        if pos.size:
+            clip_hi = float(np.percentile(pos, 99.9))
+        else:
+            clip_hi = float(np.nanmax(f)) if np.isfinite(np.nanmax(f)) else 0.0
+        f = np.minimum(f, clip_hi)
 
-    crop_h = 100
-    crop_w = 50
+        try:
+            from scipy.ndimage import uniform_filter
+            score = uniform_filter(f, size=21, mode="nearest")
+            flat = int(np.nanargmax(score))
+            cy, cx = np.unravel_index(flat, score.shape)
+        except Exception:
+            flat = int(np.nanargmax(f))
+            cy, cx = np.unravel_index(flat, f.shape)
 
-    i0 = int(np.clip(start_frame, 0, n_frames - 1))
+        return int(cy), int(cx)
 
+    def _disp_from_masked(masked: np.ndarray) -> np.ndarray:
+        """Convert masked (NaN outside ROI) to display array."""
+        if use_log:
+            return np.log10(np.clip(masked, 0.0, None) + float(log_eps))
+        return np.asarray(masked, dtype=np.float64)
+
+    def _finite_percentile(a: np.ndarray, p: float, default: float) -> float:
+        vv = np.isfinite(a)
+        if not np.any(vv):
+            return float(default)
+        return float(np.nanpercentile(a[vv], float(p)))
+
+    # ----------------------------
+    # Validate / normalize inputs
+    # ----------------------------
+    n_frames = int(run.dset_raw.shape[0])
+    if n_frames <= 0:
+        raise ValueError("Empty dataset: no frames")
+
+    i0 = int(np.clip(int(start_frame), 0, n_frames - 1))
+    frame_skip = int(max(1, frame_skip))
+    crop_size = int(max(5, crop_size))
+    fps = int(max(1, fps))
+
+    # ----------------------------
+    # Select mode: ROI label vs peak
+    # ----------------------------
+    if isinstance(mask_n, str) and mask_n.strip().lower() == "peak":
+        used_label: int | str = "peak"
+        f0 = _read_frame2d(i0)
+        cy, cx = _find_bright_region_center_in_frame(f0)
+        crop_h = crop_w = crop_size
+        roi_mask_full = None  # keep everything inside crop
+    else:
+        used_label = int(mask_n)
+        roi_mask_full, used_label = _make_roi_boolean_mask(run.dynamic_roi_map, used_label)
+        cy, cx = roi_center_from_label_map(run.dynamic_roi_map, int(used_label))
+        crop_h, crop_w = 100, 50
+
+    def _get_cropped_and_mask(frame2d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        crop, _bbox = crop_around_center(frame2d, cy, cx, crop_h=crop_h, crop_w=crop_w)
+        if roi_mask_full is None:
+            m = np.ones(crop.shape, dtype=bool)
+        else:
+            m_f, _bbox2 = crop_around_center(
+                roi_mask_full.astype(float), cy, cx, crop_h=crop_h, crop_w=crop_w
+            )
+            m = (m_f > 0)
+        return crop, m
+
+    def _render(frame_idx: int, clip_p: float) -> np.ndarray:
+        fr = _read_frame2d(frame_idx)
+        crop, m = _get_cropped_and_mask(fr)
+        masked, _lo, _hi = _apply_mask_and_clip(crop, m, float(clip_p))
+        return _disp_from_masked(masked)
+
+    # ----------------------------
+    # Fixed scaling for display/export
+    # ----------------------------
+    disp0 = _render(i0, clip_percentile_init)
+
+    if use_log:
+        # vmin
+        if fixed_log_vmin is None:
+            vmin_fixed = _finite_percentile(disp0, 1.0, np.log10(float(log_eps)))
+        else:
+            vmin_fixed = float(fixed_log_vmin)
+
+        # vmax
+        if fixed_log_vmax is None:
+            # fast default: from start frame
+            vmax_fixed = _finite_percentile(disp0, 99.9, vmin_fixed + 1.0)
+        else:
+            vmax_fixed = float(fixed_log_vmax)
+
+        # optional slow global scan ONLY if requested
+        if fixed_log_vmax is None and scan_global_vmax:
+            # scan the export range (or whole stack) in display space
+            es = 0 if export_start_frame is None else int(np.clip(export_start_frame, 0, n_frames - 1))
+            if export_n_frames is None:
+                ee = n_frames
+            else:
+                ee = int(np.clip(es + int(export_n_frames), 0, n_frames))
+            if ee <= es:
+                ee = min(n_frames, es + 1)
+
+            vmax_scan = -np.inf
+            step = frame_skip
+            block = int(max(1, scan_block))
+
+            for b0 in range(es, ee, step * block):
+                idxs = list(range(b0, min(ee, b0 + step * block), step))
+                for ii in idxs:
+                    dd = _render(int(ii), clip_percentile_init)
+                    m = float(np.nanmax(dd[np.isfinite(dd)])) if np.any(np.isfinite(dd)) else -np.inf
+                    if m > vmax_scan:
+                        vmax_scan = m
+
+            if np.isfinite(vmax_scan):
+                vmax_fixed = float(vmax_scan)
+
+    else:
+        # linear
+        vmin_fixed = _finite_percentile(disp0, 1.0, 0.0)
+        vmax_fixed = _finite_percentile(disp0, 99.9, vmin_fixed + 1.0)
+
+    # Safety
+    if not np.isfinite(vmin_fixed):
+        vmin_fixed = 0.0
+    if not np.isfinite(vmax_fixed) or vmax_fixed <= vmin_fixed:
+        vmax_fixed = vmin_fixed + 1.0
+
+    # ----------------------------
+    # Build viewer figure
+    # ----------------------------
     fig = plt.figure(figsize=(5.0, 7.0))
     gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 0.12], hspace=0.18)
 
@@ -279,57 +450,44 @@ def launch_masked_raw_viewer(
     ax_slider = fig.add_subplot(gs[1, 0])
     ax_slider.axis("off")
 
-    state = {
-        "i": i0,
-        "clip_p": float(clip_percentile_init),
-    }
+    state = {"i": i0, "clip_p": float(clip_percentile_init)}
 
-    # initial frame
-    frame_full = dset[state["i"], :, :]
-    frame, _ = crop_around_center(
-        frame_full, cy, cx,
-        crop_h=crop_h, crop_w=crop_w
+    im = ax.imshow(
+        disp0,
+        origin="upper",
+        cmap=cmap,
+        interpolation="nearest",
+        vmin=vmin_fixed,
+        vmax=vmax_fixed,
     )
-    roi_crop, _ = crop_around_center(
-        roi_mask.astype(float), cy, cx,
-        crop_h=crop_h, crop_w=crop_w
-    )
-    roi_crop = roi_crop > 0
-
-    masked, vmin, vmax = _apply_mask_and_clip(frame, roi_crop, state["clip_p"])
-
-    im = ax.imshow(masked, origin="upper", cmap=cmap, interpolation="nearest", vmin=vmin, vmax=vmax)
-    ax.set_title(f"Raw frame {state['i']}/{n_frames-1}  |  ROI label={used_label}  |  clip p={state['clip_p']:.2f}")
+    ax.set_facecolor("black")
     ax.set_xlabel("x (pixel)")
     ax.set_ylabel("y (pixel)")
+
+    def _title(frame_idx: int) -> str:
+        return (
+            f"Raw frame {frame_idx}/{n_frames-1}  |  ROI={used_label}  |  clip p={state['clip_p']:.2f}\n"
+            f"center (cx,cy)=({cx},{cy})  crop={crop_w}x{crop_h}"
+        )
+
+    ax.set_title(_title(i0))
+
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("right", size="4%", pad=0.08)
     cbar = fig.colorbar(im, cax=cax)
-    cbar.set_label("ADU (clipped)")
+    cbar.set_label("log10(ADU + eps)" if use_log else "ADU (clipped)")
 
-    # slider (placed manually within the slider row)
+    # Slider
     bbox = ax_slider.get_position()
-    x0, y0, w, h = bbox.x0, bbox.y0, bbox.width, bbox.height
-
-    axp = fig.add_axes([x0 + 0.10 * w, y0 + 0.35 * h, 0.82 * w, 0.40 * h])
+    x0s, y0s, ws, hs = bbox.x0, bbox.y0, bbox.width, bbox.height
+    axp = fig.add_axes([x0s + 0.10 * ws, y0s + 0.35 * hs, 0.82 * ws, 0.40 * hs])
     s_clip = Slider(axp, "clip percentile", 90.0, 100.0, valinit=state["clip_p"])
 
-    def _redraw():
-        frame_full = dset[state["i"], :, :]
-        frame, _ = crop_around_center(frame_full, cy, cx, crop_h=100, crop_w=50)
-
-        roi_crop, _ = crop_around_center(
-            roi_mask.astype(float), cy, cx,
-            crop_h=100, crop_w=50
-        )
-        roi_crop = roi_crop > 0
-
-        masked, vmin, vmax = _apply_mask_and_clip(frame, roi_crop, state["clip_p"])
-        im.set_data(masked)
-        im.set_clim(vmin=vmin, vmax=vmax)
-        ax.set_title(
-            f"Raw frame {state['i']}/{n_frames-1}  |  ROI label={used_label}  |  clip p={state['clip_p']:.2f}"
-        )
+    def _redraw() -> None:
+        disp = _render(state["i"], state["clip_p"])
+        im.set_data(disp)
+        im.set_clim(vmin=vmin_fixed, vmax=vmax_fixed)
+        ax.set_title(_title(state["i"]))
         fig.canvas.draw_idle()
 
     def on_key(event):
@@ -339,10 +497,10 @@ def launch_masked_raw_viewer(
         elif event.key in ("left", "a"):
             state["i"] = max(0, state["i"] - 1)
             _redraw()
-        elif event.key in ("home",):
+        elif event.key == "home":
             state["i"] = 0
             _redraw()
-        elif event.key in ("end",):
+        elif event.key == "end":
             state["i"] = n_frames - 1
             _redraw()
 
@@ -353,8 +511,84 @@ def launch_masked_raw_viewer(
     s_clip.on_changed(on_clip)
     fig.canvas.mpl_connect("key_press_event", on_key)
 
+    # ----------------------------
+    # MP4 EXPORT (no global scanning unless explicitly requested)
+    # ----------------------------
+    export_info: dict = {}
+    if mp4_export:
+        export_path_p = Path(export_path)
+        export_path_p.parent.mkdir(parents=True, exist_ok=True)
+
+        es = 0 if export_start_frame is None else int(np.clip(export_start_frame, 0, n_frames - 1))
+        if export_n_frames is None:
+            ee = n_frames
+        else:
+            ee = int(np.clip(es + int(export_n_frames), 0, n_frames))
+        if ee <= es:
+            ee = min(n_frames, es + 1)
+
+        frame_indices = list(range(es, ee, frame_skip))
+        print(f"Exporting MP4: frames {es} -> {ee-1} (step={frame_skip})  total={len(frame_indices)}")
+        print(f"  -> {export_path_p}")
+
+        # Use Matplotlib's ffmpeg writer (requires ffmpeg on PATH)
+        from matplotlib.animation import FFMpegWriter
+
+        try:
+            writer = FFMpegWriter(
+                fps=fps,
+                bitrate=2000,
+                codec="libx264",
+                extra_args=["-pix_fmt", "yuv420p"],
+            )
+            with writer.saving(fig, str(export_path_p), dpi=150):
+                for k, fi in enumerate(frame_indices):
+                    state["i"] = int(fi)
+                    disp = _render(int(fi), state["clip_p"])
+                    im.set_data(disp)
+                    im.set_clim(vmin=vmin_fixed, vmax=vmax_fixed)
+                    ax.set_title(_title(int(fi)))
+                    writer.grab_frame()
+                    if (k + 1) % 200 == 0 or (k + 1) == len(frame_indices):
+                        print(f"  wrote {k+1}/{len(frame_indices)} frames")
+        except FileNotFoundError as e:
+            if "ffmpeg" in str(e).lower():
+                raise FileNotFoundError(
+                    "ffmpeg not found. MP4 export requires ffmpeg on your PATH. "
+                    "Install it with: brew install ffmpeg  (macOS) or apt install ffmpeg  (Linux)."
+                ) from e
+            raise
+
+        print(f"Saved MP4 -> {export_path_p}")
+
+        export_info.update(
+            {
+                "mp4_export": True,
+                "export_path": str(export_path_p),
+                "export_start_frame": int(es),
+                "export_end_frame": int(ee - 1),
+                "frame_skip": int(frame_skip),
+                "fps": int(fps),
+            }
+        )
+
     plt.show()
-    return {"roi_label_used": used_label, "roi_pixel_count": int(np.sum(roi_mask))}
+
+    # ----------------------------
+    # Return summary
+    # ----------------------------
+    roi_px = int(np.sum(roi_mask_full)) if roi_mask_full is not None else int(crop_h * crop_w)
+    out = {
+        "roi_label_used": used_label,
+        "roi_pixel_count": roi_px,
+        "center_cxcy": (float(cx), float(cy)),
+        "crop_wh": (int(crop_w), int(crop_h)),
+        "vmin_fixed": float(vmin_fixed),
+        "vmax_fixed": float(vmax_fixed),
+    }
+    out.update(export_info)
+    return out
+
 
 def roi_center_from_label_map(dynamic_roi_map, mask_n: int):
     """
@@ -2126,7 +2360,7 @@ def mask_roi_viewer():
 
     run = load_run_data(BASE_DIR, SAMPLE_ID, mask_n=MASK_N)
 
-    launch_masked_raw_viewer(run, mask_n=MASK_N, start_frame=0, clip_percentile_init=99.9)
+    launch_masked_raw_viewer(run, mask_n="peak", start_frame=0, clip_percentile_init=99.9, crop_size=300, mp4_export=True)
 
     run.close()
 
@@ -2201,8 +2435,8 @@ def ttc_with_custom_mask():
         base_dir=BASE_DIR,
         sample_id=SAMPLE_ID,
         mask_n_for_loading=MASK_N,      # only used to load run/scattering/results paths
-        r_inner_px=140.0,
-        r_outer_px=150.0,
+        r_inner_px=160.0,
+        r_outer_px=170.0,
         center_px=(1198, 216),  # (cx, cy) or None to auto-detect
         bright_percentile=99.9,
         shape='semi',  # "semi" or "circle"
@@ -2213,11 +2447,6 @@ def ttc_with_custom_mask():
         clip_hi_percentile=99.9,
     )
 
-def integrated_intensities_inspector():
-
-
-
-    pass
 
 
 # ============================================================
@@ -2233,9 +2462,8 @@ CONTROL_MASK_N = 176
 if __name__ == "__main__":
 
     # data_structure_viewer()
-    # mask_roi_viewer()
+    mask_roi_viewer()
     # raw_mask_oscillation_inspector()
-    # integrated_intensities_inspector()
     # comparison_of_corr_and_g_ttc_plot_methods()
     # compare_existing_vs_corr_entrypoint()
     # compare_existing_ttc_and_cgpt_ttc_from_raw()
